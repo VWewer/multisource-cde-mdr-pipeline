@@ -1,0 +1,65 @@
+{
+  "Critical Path \u2014 All": {
+    "owner": "project.director",
+    "shared": true,
+    "created_at": "2026-05-08 19:17:51.423354+00:00",
+    "filters": {
+      "is_on_critical_path": true
+    },
+    "sort": {
+      "field": "schedule_float_days",
+      "ascending": true
+    },
+    "columns": [
+      "mdr_id",
+      "document_title",
+      "discipline",
+      "priority",
+      "rag_status",
+      "schedule_float_days",
+      "current_canonical_status"
+    ]
+  },
+  "My Red Items": {
+    "owner": "project.director",
+    "shared": false,
+    "created_at": "2026-05-08 19:17:51.423376+00:00",
+    "filters": {
+      "rag_status": "RED"
+    },
+    "sort": {
+      "field": "schedule_float_days",
+      "ascending": true
+    },
+    "columns": [
+      "mdr_id",
+      "document_title",
+      "discipline",
+      "priority",
+      "schedule_float_days",
+      "date_trend",
+      "responsible_person"
+    ]
+  },
+  "Mechanical Register": {
+    "owner": "james.okafor",
+    "shared": true,
+    "created_at": "2026-05-08 19:17:51.423384+00:00",
+    "filters": {
+      "discipline": "Mechanical"
+    },
+    "sort": {
+      "field": "planned_approval_date",
+      "ascending": true
+    },
+    "columns": [
+      "mdr_id",
+      "document_title",
+      "approval_class",
+      "priority",
+      "rag_status",
+      "planned_approval_date",
+      "reported_percent_complete"
+    ]
+  }
+}

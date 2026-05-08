@@ -41,6 +41,35 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 TODAY = date(2026, 5, 8)  # fixed for demo dataset
 
+# ── Debug / logging ────────────────────────────────────────────────────────────
+# Set DEBUG=true in your .env file to unlock extra verbose terminal output.
+# Key lifecycle events (load, save, edit, filter, etc.) always print regardless
+# of this flag — DEBUG just adds extra detail like column lists and row samples.
+DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
+
+
+def _log(label: str, msg: str):
+    """Print a timestamped lifecycle event to the terminal.
+
+    This is your window into what the app is doing step by step.
+    The terminal where you ran 'streamlit run' is where these appear.
+
+    Args:
+        label: A short category tag. Conventions (from CLAUDE.md):
+               [LOAD]      reading data from disk
+               [SAVE]      writing data to disk
+               [EDIT]      a user changed a field in the dashboard
+               [SNOWFLAKE] a query was sent to Snowflake
+               [FILTER]    a filter was applied to the MDR data
+               [BOOKMARK]  a watchlist entry was added or removed
+               [VIEW]      a saved view was loaded or written
+               [ERROR]     something went wrong
+        msg:   A plain-English description of what happened.
+    """
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [{label}] {msg}")
+
+
 # ── Streamlit page config ──────────────────────────────────────────────────────
 st.set_page_config(
     page_title="MDR Control | PROJ1",
@@ -366,12 +395,33 @@ USERS = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_mdr() -> pd.DataFrame:
-    """Load MDR CSV — source of truth for the ANALYTICAL layer."""
+    """Load the MDR CSV into a DataFrame — source of truth for all dashboard data.
+
+    The CSV lives at data_generation/mdr_requirements.csv. Every inline edit
+    the user makes in the dashboard is written back to this same file via save_mdr().
+
+    Returns:
+        pd.DataFrame: 60-row MDR with date columns parsed as Python datetime objects.
+
+    Side effects:
+        Calls st.stop() and shows a browser error if the CSV file is missing.
+    """
+    _log("LOAD", f"Reading MDR from {MDR_CSV}")
+
     if not MDR_CSV.exists():
+        _log("ERROR", f"MDR CSV not found at {MDR_CSV} — run generate_mdr_layer.py first")
         st.error(f"MDR CSV not found at {MDR_CSV}. Run generate_mdr_layer.py first.")
         st.stop()
+
     df = pd.read_csv(MDR_CSV, parse_dates=["planned_submission_date", "planned_approval_date",
                                             "baseline_approval_date", "previous_approval_date"])
+    _log("LOAD", f"MDR loaded — {len(df)} rows × {len(df.columns)} columns")
+
+    if DEBUG:
+        # Extra detail: RAG breakdown lets you verify the data looks right at a glance
+        print(f"         RAG distribution: {df['rag_status'].value_counts().to_dict()}")
+        print(f"         Columns: {list(df.columns)}")
+
     return df
 
 
@@ -441,7 +491,28 @@ def load_bookmarks() -> pd.DataFrame:
 
 
 def log_edit(username: str, mdr_id: str, field: str, old_val, new_val):
-    """Append an edit event to edit_log.csv."""
+    """Append a single field change to the audit log (edit_log.csv).
+
+    This is an append-only file — entries are never deleted or modified.
+    It gives a full history of every change made to the MDR through the dashboard.
+
+    Each row records:
+        timestamp  — when the change happened (UTC, so it's timezone-safe)
+        username   — which mock user made the change (e.g. "sarah.chen")
+        mdr_id     — which document was changed (e.g. "MDR-INS-001")
+        field      — which column was edited (e.g. "priority")
+        old_value  — the value before the edit (stored as a plain string)
+        new_value  — the value after the edit (stored as a plain string)
+
+    Args:
+        username: The currently active mock user.
+        mdr_id:   The document identifier.
+        field:    The column name that was changed.
+        old_val:  The previous value (any type — converted to str for storage).
+        new_val:  The new value (any type — converted to str for storage).
+    """
+    _log("EDIT", f"{username} | {mdr_id} | {field}: '{old_val}' → '{new_val}'")
+
     row = {
         "timestamp":  str(datetime.now(timezone.utc)),
         "username":   username,
@@ -452,23 +523,46 @@ def log_edit(username: str, mdr_id: str, field: str, old_val, new_val):
     }
     cols = list(row.keys())
     exists = EDIT_LOG_CSV.exists()
-    with open(EDIT_LOG_CSV, "a", newline="", encoding="utf-8") as f:
-        import csv as _csv
-        w = _csv.DictWriter(f, fieldnames=cols)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
+
+    try:
+        with open(EDIT_LOG_CSV, "a", newline="", encoding="utf-8") as f:
+            import csv as _csv
+            w = _csv.DictWriter(f, fieldnames=cols)
+            if not exists:
+                # First ever entry — write the column headers before the first row
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        _log("ERROR", f"Failed to write edit log: {e}")
 
 
 def save_mdr(df: pd.DataFrame):
-    """Write the MDR DataFrame back to CSV (date columns as ISO strings)."""
+    """Write the MDR DataFrame back to CSV, persisting any edits the user made.
+
+    Date columns need special handling: pandas stores dates as Python datetime
+    objects in memory, but CSV is plain text. If we wrote them directly, they'd
+    appear as a long internal format like '2026-05-08 00:00:00'. Converting to
+    str() first gives clean ISO format: '2026-05-08'.
+
+    Args:
+        df: The full MDR DataFrame, including any rows the user has edited.
+    """
+    _log("SAVE", f"Writing {len(df)} rows to {MDR_CSV}")
+
+    # These columns hold Python datetime objects — convert to plain strings for CSV
     date_cols = ["planned_submission_date", "planned_approval_date",
                  "baseline_approval_date", "previous_approval_date"]
     out = df.copy()
     for col in date_cols:
         if col in out.columns:
             out[col] = out[col].astype(str)
-    out.to_csv(MDR_CSV, index=False)
+
+    try:
+        out.to_csv(MDR_CSV, index=False)
+        _log("SAVE", "MDR CSV updated successfully")
+    except Exception as e:
+        _log("ERROR", f"Failed to write MDR CSV: {e}")
+        st.error(f"Could not save changes: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,7 +571,22 @@ def save_mdr(df: pd.DataFrame):
 
 @st.cache_resource(ttl=300)
 def get_snowflake_connection():
-    """Returns a Snowflake connection or None if credentials missing."""
+    """Open a connection to Snowflake and cache it for 5 minutes.
+
+    @st.cache_resource means Streamlit creates this connection once and reuses
+    it across all reruns until the TTL (time-to-live) of 300 seconds expires.
+    Without caching, every button click would open a new database connection,
+    which is slow (1-3 seconds) and wasteful.
+
+    Reads these keys from .env (loaded at startup via load_dotenv):
+        SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ACCOUNT,
+        SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_ROLE (optional)
+
+    Returns:
+        A live Snowflake connection object, or None if anything went wrong.
+        Callers must check for None before using the connection.
+    """
+    _log("SNOWFLAKE", "Opening connection to Snowflake...")
     try:
         import snowflake.connector
         conn = snowflake.connector.connect(
@@ -488,19 +597,53 @@ def get_snowflake_connection():
             database  = os.environ["SNOWFLAKE_DATABASE"],
             role      = os.environ.get("SNOWFLAKE_ROLE", ""),
         )
+        _log("SNOWFLAKE", f"Connected — database: {os.environ['SNOWFLAKE_DATABASE']}")
         return conn
-    except Exception:
+    except KeyError as e:
+        # KeyError means the variable name doesn't exist in .env at all
+        _log("ERROR", f"Missing Snowflake credential in .env: {e} — check .env.example for required keys")
+        return None
+    except Exception as e:
+        # Catches wrong password, suspended warehouse, bad account name, network issues, etc.
+        _log("ERROR", f"Snowflake connection failed: {e}")
         return None
 
 
 @st.cache_data(ttl=300)
 def query_snowflake(sql: str) -> pd.DataFrame:
+    """Run a read-only SQL query against Snowflake and return the results as a DataFrame.
+
+    @st.cache_data means identical queries within 5 minutes return a cached copy
+    instead of hitting the database again. This keeps the dashboard fast — Snowflake
+    queries can take 1-5 seconds each, and Streamlit reruns on every interaction.
+
+    This function is used for RAW and STAGED layer data (read-only display).
+    The ANALYTICAL layer (MDR) is read from the local CSV instead, because
+    dashboard edits write to the CSV, not back to Snowflake.
+
+    Args:
+        sql: A SELECT query string. Do not pass INSERT/UPDATE/DELETE here.
+
+    Returns:
+        pd.DataFrame with query results, or an empty DataFrame if the connection
+        is unavailable or the query fails. Always check if the result is empty
+        before trying to use it.
+    """
+    # Truncate the SQL in the log so long queries don't flood the terminal
+    preview = sql.strip().replace("\n", " ")
+    _log("SNOWFLAKE", f"Query: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+
     conn = get_snowflake_connection()
     if conn is None:
+        _log("ERROR", "Snowflake query skipped — no active connection")
         return pd.DataFrame()
+
     try:
-        return pd.read_sql(sql, conn)
+        result = pd.read_sql(sql, conn)
+        _log("SNOWFLAKE", f"Query returned {len(result)} rows")
+        return result
     except Exception as e:
+        _log("ERROR", f"Snowflake query failed: {e}")
         st.warning(f"Snowflake query failed: {e}")
         return pd.DataFrame()
 
@@ -893,9 +1036,213 @@ def page_overview(df: pd.DataFrame, current_user: str):
 # PAGE STUBS (Day 4+)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | None):
+def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | None):  # noqa: C901
     st.markdown('<div class="page-title">MDR Register</div>', unsafe_allow_html=True)
-    st.info("🚧 MDR Register — to be built Day 4. Will include full filterable/sortable table with inline editing, bookmark toggles, and Excel export.")
+
+    # Load saved view defaults
+    views     = load_saved_views()
+    view_data = views.get(active_view, {}) if active_view else {}
+    vf        = view_data.get("filters", {})
+    v_cols    = view_data.get("columns", [])
+    v_sort    = view_data.get("sort", {})
+
+    # Reset filter widget state when the active view changes so new defaults apply
+    if st.session_state.get("_reg_view") != active_view:
+        st.session_state["_reg_view"] = active_view
+        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_cols"):
+            st.session_state.pop(k, None)
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    with st.expander("Filters", expanded=True):
+        fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
+
+        disc_opts  = ["All"] + sorted(df["discipline"].dropna().unique().tolist())
+        rag_opts   = ["All", "RED", "AMBER", "GREEN"]
+        prio_opts  = ["All", "Very High", "High", "Medium", "Low"]
+        cp_opts    = ["All", "Critical Path only", "Non-critical only"]
+        appr_opts  = ["All"] + sorted(df["approval_class"].dropna().unique().tolist())
+        trend_opts = ["All", "SLIPPING", "STALLED", "RECOVERING", "STABLE"]
+
+        def _idx(lst, val): return lst.index(val) if val in lst else 0
+
+        sel_disc  = fc1.selectbox("Discipline",    disc_opts,  index=_idx(disc_opts,  vf.get("discipline")),     key="reg_disc")
+        sel_rag   = fc2.selectbox("RAG",           rag_opts,   index=_idx(rag_opts,   vf.get("rag_status")),     key="reg_rag")
+        sel_prio  = fc3.selectbox("Priority",      prio_opts,  index=_idx(prio_opts,  vf.get("priority")),       key="reg_prio")
+        vf_cp_val = "Critical Path only" if vf.get("is_on_critical_path") is True else ("Non-critical only" if vf.get("is_on_critical_path") is False else "All")
+        sel_cp    = fc4.selectbox("Critical Path", cp_opts,    index=_idx(cp_opts,    vf_cp_val),                key="reg_cp")
+        sel_appr  = fc5.selectbox("Approval",      appr_opts,  index=_idx(appr_opts,  vf.get("approval_class")), key="reg_appr")
+        sel_trend = fc6.selectbox("Date Trend",    trend_opts, index=_idx(trend_opts, vf.get("date_trend")),     key="reg_trend")
+
+    # Apply filters — each line narrows the DataFrame by one criterion
+    filt = df.copy()
+    if sel_disc  != "All": filt = filt[filt["discipline"]        == sel_disc]
+    if sel_rag   != "All": filt = filt[filt["rag_status"]        == sel_rag]
+    if sel_prio  != "All": filt = filt[filt["priority"]          == sel_prio]
+    if sel_cp    == "Critical Path only": filt = filt[filt["is_on_critical_path"] == True]
+    elif sel_cp  == "Non-critical only":  filt = filt[filt["is_on_critical_path"] != True]
+    if sel_appr  != "All": filt = filt[filt["approval_class"]    == sel_appr]
+    if sel_trend != "All": filt = filt[filt["date_trend"]        == sel_trend]
+
+    _log("FILTER", (
+        f"disc={sel_disc} | rag={sel_rag} | prio={sel_prio} | "
+        f"cp={sel_cp} | appr={sel_appr} | trend={sel_trend} "
+        f"→ {len(filt)} of {len(df)} rows"
+    ))
+
+    # ── Column selector ───────────────────────────────────────────────────────
+    EDITABLE_COLS = ["is_on_critical_path", "priority", "reported_percent_complete", "notes"]
+    ALL_OPTIONAL  = [
+        "document_title", "discipline", "priority", "rag_status", "is_on_critical_path",
+        "schedule_float_days", "date_trend", "current_canonical_status", "approval_class",
+        "planned_approval_date", "total_slip_days", "responsible_person",
+        "reported_percent_complete", "derived_percent_complete", "source_system", "notes",
+    ]
+    DEFAULT_COLS = [
+        "document_title", "discipline", "priority", "rag_status", "is_on_critical_path",
+        "schedule_float_days", "date_trend", "current_canonical_status",
+        "reported_percent_complete", "responsible_person", "notes",
+    ]
+    col_default   = [c for c in (v_cols or DEFAULT_COLS) if c in ALL_OPTIONAL]
+    selected_cols = st.multiselect("Columns", options=ALL_OPTIONAL, default=col_default, key="reg_cols")
+
+    display_cols = ["mdr_id"] + [c for c in selected_cols if c != "mdr_id"]
+
+    # ── Sort ──────────────────────────────────────────────────────────────────
+    s1, s2, _ = st.columns([3, 1, 4])
+    sort_field = s1.selectbox(
+        "Sort by", display_cols,
+        index=_idx(display_cols, v_sort.get("field", "schedule_float_days")),
+        key="reg_sort_field",
+    )
+    sort_asc = s2.checkbox("Ascending", value=v_sort.get("ascending", True), key="reg_sort_asc")
+
+    filt_sorted = filt.sort_values(sort_field, ascending=sort_asc, na_position="last") \
+                  if sort_field in filt.columns else filt
+
+    # ── Bookmarks ─────────────────────────────────────────────────────────────
+    bookmarks   = load_bookmarks()
+    user_bm_ids = set(bookmarks[bookmarks["username"] == current_user]["mdr_id"].tolist())
+
+    # ── Build display df ──────────────────────────────────────────────────────
+    display_df = filt_sorted[display_cols].copy().reset_index(drop=True)
+    display_df.insert(1, "bookmarked", display_df["mdr_id"].isin(user_bm_ids))
+
+    st.markdown(
+        f'<div style="font-size:0.75rem;color:#7a8499;margin:0.25rem 0 0.5rem 0;">'
+        f'Showing <b>{len(display_df)}</b> of {len(df)} documents</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Column config ─────────────────────────────────────────────────────────
+    col_cfg = {
+        "mdr_id":                    st.column_config.TextColumn("ID", width="small", disabled=True),
+        "bookmarked":                st.column_config.CheckboxColumn("⭐", width="small", help="Add to My Watchlist"),
+        "document_title":            st.column_config.TextColumn("Title", width="large", disabled=True),
+        "discipline":                st.column_config.TextColumn("Discipline", disabled=True),
+        "priority":                  st.column_config.SelectboxColumn("Priority", options=["Very High", "High", "Medium", "Low"]),
+        "rag_status":                st.column_config.TextColumn("RAG", width="small", disabled=True),
+        "is_on_critical_path":       st.column_config.CheckboxColumn("Crit. Path"),
+        "schedule_float_days":       st.column_config.NumberColumn("Float (d)", format="%d", disabled=True),
+        "date_trend":                st.column_config.TextColumn("Trend", width="small", disabled=True),
+        "current_canonical_status":  st.column_config.TextColumn("Status", disabled=True),
+        "approval_class":            st.column_config.TextColumn("Approval Class", disabled=True),
+        "planned_approval_date":     st.column_config.DateColumn("Planned Approval", disabled=True),
+        "total_slip_days":           st.column_config.NumberColumn("Slip (d)", format="%d", disabled=True),
+        "responsible_person":        st.column_config.TextColumn("Responsible", disabled=True),
+        "reported_percent_complete": st.column_config.NumberColumn("% Complete", min_value=0, max_value=100, step=5, format="%d%%"),
+        "derived_percent_complete":  st.column_config.NumberColumn("% Complete (auto)", format="%.0f%%", disabled=True),
+        "source_system":             st.column_config.TextColumn("Source System", disabled=True),
+        "notes":                     st.column_config.TextColumn("Notes", width="large"),
+    }
+
+    # ── Editable table ────────────────────────────────────────────────────────
+    edited_df = st.data_editor(
+        display_df,
+        column_config=col_cfg,
+        use_container_width=True,
+        hide_index=True,
+        key="mdr_register_editor",
+        num_rows="fixed",
+    )
+
+    # ── Persist MDR edits ─────────────────────────────────────────────────────
+    has_changes = False
+    for edit_col in EDITABLE_COLS:
+        if edit_col not in display_df.columns:
+            continue
+        orig    = display_df[edit_col]
+        new     = edited_df[edit_col]
+        changed = ~(orig.eq(new) | (orig.isna() & new.isna()))
+        if changed.any():
+            for i, row in edited_df[changed].iterrows():
+                mdr_id  = row["mdr_id"]
+                old_val = orig.iloc[i]
+                new_val = row[edit_col]
+                df.loc[df["mdr_id"] == mdr_id, edit_col] = new_val
+                log_edit(current_user, mdr_id, edit_col, old_val, new_val)
+            has_changes = True
+    if has_changes:
+        save_mdr(df)
+        st.toast("Changes saved.", icon="✅")
+        st.rerun()
+
+    # ── Persist bookmark changes ───────────────────────────────────────────────
+    bm_changed = ~(display_df["bookmarked"].eq(edited_df["bookmarked"]))
+    if bm_changed.any():
+        all_bm = load_bookmarks()
+        for i, row in edited_df[bm_changed].iterrows():
+            mdr_id = row["mdr_id"]
+            if bool(row["bookmarked"]):
+                # User ticked the star — add a new bookmark entry
+                _log("BOOKMARK", f"{current_user} added {mdr_id} to watchlist")
+                new_entry = pd.DataFrame([{"username": current_user, "mdr_id": mdr_id,
+                                           "personal_note": "", "created_at": str(TODAY)}])
+                all_bm = pd.concat([all_bm, new_entry], ignore_index=True)
+            else:
+                # User unticked the star — remove their bookmark for this document
+                _log("BOOKMARK", f"{current_user} removed {mdr_id} from watchlist")
+                all_bm = all_bm[~((all_bm["username"] == current_user) & (all_bm["mdr_id"] == mdr_id))]
+        try:
+            all_bm.to_csv(BOOKMARKS_CSV, index=False)
+        except Exception as e:
+            _log("ERROR", f"Failed to write bookmarks CSV: {e}")
+        st.toast("Watchlist updated.", icon="⭐")
+        st.rerun()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    import io
+    try:
+        buf = io.BytesIO()
+        filt_sorted[display_cols].to_excel(buf, index=False, engine="openpyxl")
+        buf.seek(0)
+        st.download_button(
+            "📥 Export to Excel", data=buf,
+            file_name=f"MDR_Register_{TODAY}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_export",
+        )
+    except ImportError:
+        csv_data = filt_sorted[display_cols].to_csv(index=False)
+        st.download_button(
+            "📥 Export to CSV", data=csv_data,
+            file_name=f"MDR_Register_{TODAY}.csv",
+            mime="text/csv",
+            key="btn_export",
+        )
+
+    # ── Update saved view payload (consumed by sidebar Save) ─────────────────
+    st.session_state["current_view_payload"] = {
+        "filters": {k: v for k, v in {
+            "discipline":          sel_disc  if sel_disc  != "All" else None,
+            "rag_status":          sel_rag   if sel_rag   != "All" else None,
+            "priority":            sel_prio  if sel_prio  != "All" else None,
+            "is_on_critical_path": (True if sel_cp == "Critical Path only" else (False if sel_cp == "Non-critical only" else None)),
+            "approval_class":      sel_appr  if sel_appr  != "All" else None,
+            "date_trend":          sel_trend if sel_trend != "All" else None,
+        }.items() if v is not None},
+        "columns": selected_cols,
+        "sort":    {"field": sort_field, "ascending": sort_asc},
+    }
 
 
 def page_watchlist(df: pd.DataFrame, current_user: str):
