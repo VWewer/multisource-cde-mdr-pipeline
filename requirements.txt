@@ -1,0 +1,5 @@
+snowflake-connector-python
+pandas
+streamlit
+faker
+python-dotenv
