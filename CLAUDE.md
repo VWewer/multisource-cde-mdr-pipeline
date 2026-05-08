@@ -56,6 +56,18 @@ multisource-cde-mdr-pipeline/
 
 ---
 
+## Dashboard build status
+
+| Page | Status | Notes |
+|---|---|---|
+| Overview | ✅ Complete | RAG tiles, trend summary, critical path table, gatekeeper heatmap, discipline summary |
+| MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views |
+| My Watchlist | 🔲 Stub | Shows bookmarks df only — full build pending |
+| Document Detail | 🔲 Stub | Shows JSON row only — STAGED timeline pending |
+| Source System Health | 🔲 Stub | Placeholder only |
+
+---
+
 ## How to run
 
 ### Generate data (run once, in this order)
