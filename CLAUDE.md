@@ -127,6 +127,18 @@ The terminal will print extra detail on every lifecycle event.
   filter application, bookmark change.
 - Extra verbose output (data shapes, column lists, sample rows) goes behind `if DEBUG:`.
 
+### Unicode / Windows terminal
+- **Never use Unicode box-drawing or symbol characters in `print()` statements.**
+  Characters like `✓`, `→`, `←`, `─`, `──`, `█`, `−` cause a `UnicodeEncodeError`
+  on Windows PowerShell (cp1252 encoding) and crash the script.
+- Use plain ASCII equivalents instead: `OK:` not `✓`, `->` not `→`, `-` not `─`, `#` not `█`.
+- This applies to all scripts in `data_generation/` and any new scripts added to this project.
+- If you see a `UnicodeEncodeError` in a print statement, this is always the cause.
+
+### Lessons learned — when to update this file
+- Any time we hit a systematic error (encoding, path, venv, tool limitation), add it here.
+- The test: "would a future Claude session reproduce this mistake without this note?" If yes, write it down.
+
 ### Error handling
 - Every error path must print `[ERROR]` with: what was attempted, what failed, what to do next.
 - Never silently swallow an exception with a bare `except: pass` or `except Exception: return None`.
@@ -201,3 +213,4 @@ The terminal will print extra detail on every lifecycle event.
 | `MDR CSV not found` | Scripts not run yet | Run `generate_mdr_layer.py` first |
 | Streamlit shows blank page | Syntax error in app.py | Run the py_compile check |
 | Filter shows 0 rows | Filters combined too aggressively | Reset all filters to "All" |
+| `UnicodeEncodeError: 'charmap' codec can't encode character` | Unicode symbol in a `print()` statement — Windows PowerShell uses cp1252 encoding which doesn't support `✓`, `→`, `─`, `█` etc. | Replace with ASCII: `OK:`, `->`, `-`, `#`. Never use Unicode symbols in print statements. |

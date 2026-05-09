@@ -250,13 +250,13 @@ def main():
         writer.writeheader()
         writer.writerows(all_events)
 
-    print(f"✓ Written {len(all_events)} events → {output_path}")
+    print(f"OK: Written {len(all_events)} events -> {output_path}")
     print_summary(all_events)
 
 
 def print_summary(events: list):
     from collections import Counter
-    print("\n── STAGED Layer Summary ──────────────────────────────")
+    print("\n--- STAGED Layer Summary ----------------------------------------")
     print(f"Total events : {len(events)}")
     actual_count = sum(1 for e in events if e["actual_timestamp"])
     print(f"  Actual (completed) : {actual_count}")
@@ -271,12 +271,12 @@ def print_summary(events: list):
     if variances:
         avg = sum(variances) / len(variances)
         late = sum(1 for v in variances if v > 0)
-        print(f"\nVariance (actual − planned):")
+        print(f"\nVariance (actual - planned):")
         print(f"  Mean : {avg:+.1f}d  Min : {min(variances):+d}d  Max : {max(variances):+d}d")
         print(f"  Late : {late}/{len(variances)} transitions ({100*late//len(variances)}%)")
 
     print(f"\nRevision loops : {sum(1 for e in events if e['to_status'] == 'REVISION_REQUIRED')}")
-    print("─────────────────────────────────────────────────────")
+    print("-" * 53)
 
 
 if __name__ == "__main__":

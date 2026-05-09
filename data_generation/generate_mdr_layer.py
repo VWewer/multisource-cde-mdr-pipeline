@@ -416,13 +416,13 @@ def main():
         writer.writeheader()
         writer.writerows(mdr_records)
 
-    print(f"✓ Written {len(mdr_records)} MDR rows → {output_path}")
+    print(f"OK: Written {len(mdr_records)} MDR rows -> {output_path}")
     print_summary(mdr_records)
 
 
 def print_summary(records: list):
     from collections import Counter
-    print("\n── MDR (ANALYTICAL) Layer Summary ───────────────────")
+    print("\n--- MDR (ANALYTICAL) Layer Summary ------------------------------")
     print(f"Total requirements : {len(records)}")
 
     for label, key in [
@@ -434,7 +434,7 @@ def print_summary(records: list):
         counts = Counter(r[key] for r in records)
         print(f"\n{label}:")
         for k, v in sorted(counts.items(), key=lambda x: -x[1]):
-            bar = "█" * v
+            bar = "#" * v
             print(f"  {k:<20} {v:>3}  {bar}")
 
     cp_count = sum(1 for r in records if str(r["is_on_critical_path"]) == "True")
@@ -445,7 +445,7 @@ def print_summary(records: list):
     print(f"  Overdue (< 0) : {sum(1 for f in floats if f < 0)}")
     print(f"  Min / Median / Max : {min(floats)} / {floats[len(floats)//2]} / {max(floats)}")
 
-    print("\nRAG × Priority cross-tab:")
+    print("\nRAG x Priority cross-tab:")
     from collections import defaultdict
     cross = defaultdict(int)
     for r in records:
@@ -457,7 +457,7 @@ def print_summary(records: list):
         grand["RED"] += red; grand["AMBER"] += amber; grand["GREEN"] += green
         print(f"  {p:<12} {red:>5} {amber:>6} {green:>6} {red+amber+green:>7}")
     print(f"  {'TOTAL':<12} {grand['RED']:>5} {grand['AMBER']:>6} {grand['GREEN']:>6} {sum(grand.values()):>7}")
-    print("─────────────────────────────────────────────────────")
+    print("-" * 53)
 
 
 PRIORITY_ORDER = ["Very High", "High", "Medium", "Low"]

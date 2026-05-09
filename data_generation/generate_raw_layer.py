@@ -402,12 +402,12 @@ def write_csv(records: list, path: str):
         writer = csv.DictWriter(f, fieldnames=list(records[0].keys()))
         writer.writeheader()
         writer.writerows(records)
-    print(f"✓ Written {len(records)} records → {path}")
+    print(f"OK: Written {len(records)} records -> {path}")
 
 
 def print_summary(records: list):
     from collections import Counter
-    print("\n── RAW Layer Summary ─────────────────────────────────")
+    print("\n--- RAW Layer Summary -------------------------------------------")
     print(f"Total records : {len(records)}")
     for label, key in [
         ("Source system instance", "source_system_instance"),
@@ -427,7 +427,7 @@ def print_summary(records: list):
     print(f"\nSample ISO 19650 filenames:")
     for r in records[:3]:
         print(f"  {r['iso19650_filename']}")
-    print("─────────────────────────────────────────────────────")
+    print("-" * 53)
 
 
 if __name__ == "__main__":
