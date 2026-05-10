@@ -192,6 +192,48 @@ Per source system, the page shows:
 | Document Detail | 🔲 Stub | Shows JSON row only — STAGED timeline pending |
 | Source System Health | 🔲 Planned | Per-source RAG, DQ flag counts, DC remediation queue — design complete, build pending |
 
+## Pipeline build status (v2)
+
+| Component | Status | Notes |
+|---|---|---|
+| `generate_windchill_source.py` | ✅ Complete | 30 rows, source-native schema, 5 DQ issues injected |
+| `generate_sharepoint_source.py` | ✅ Complete | 20 rows, source-native schema, 4 DQ issues injected |
+| `generate_aveva_source.py` | ✅ Complete | 10 rows, source-native schema, 1 DQ issue injected |
+| `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files |
+| `generate_mdr_layer.py` | ✅ Unchanged | Still works — reads new raw_documents.csv without modification |
+| Role selector (dashboard) | 🔲 Next | st.radio in sidebar: Read Only / Project Manager / Document Controller |
+| Source System Health page | 🔲 After role | Reads staged_dq_flags.csv, shows DC remediation queue |
+
+## Next session — start here
+
+**Step 1: Role selector in `dashboard/app.py`**
+
+Add a `st.radio` to the sidebar with three options:
+- Read Only (default)
+- Project Manager — can edit priority, critical path, percent complete, notes
+- Document Controller — can resolve DQ flags in remediation queue
+
+Store the active role in `st.session_state["active_role"]`.
+
+Gate the existing editable fields in MDR Register behind `active_role == "Project Manager"`.
+
+**Step 2: Source System Health page**
+
+Reads `data_generation/staged_dq_flags.csv`.
+Shows:
+- Per-source-system summary table (record count, DQ flag count, RAG status)
+- Drilldown table of unresolved flags filtered by `resolved == False`
+- DC-only edit: a "Mark resolved" button that sets `resolved=True`, `resolved_by`, `resolved_at`
+  and appends a `DQ_REMEDIATION` event to `staged_events.csv`
+
+Only visible / editable when `active_role == "Document Controller"`.
+
+## Important field added in v2
+
+`raw_documents.csv` now contains a `mdr_id` field (canonical ISO 19650 ID).
+`generate_mdr_layer.py` ignores it (reads only named fields it needs).
+The dashboard can use `mdr_id` as the stable display identifier for documents.
+
 ---
 
 ## How to run
