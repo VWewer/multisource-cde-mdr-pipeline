@@ -390,6 +390,18 @@ USERS = {
     "project.director": {"display": "Project Director",  "role": "All Disciplines",         "discipline": None},
 }
 
+# ── Role constants ─────────────────────────────────────────────────────────────
+# Single source of truth for role names — avoids scattered string literals
+# that break silently on a typo.
+ROLE_READ_ONLY           = "Read Only"
+ROLE_PROJECT_MANAGER     = "Project Manager"
+ROLE_DOCUMENT_CONTROLLER = "Document Controller"
+ROLES                    = [ROLE_READ_ONLY, ROLE_PROJECT_MANAGER, ROLE_DOCUMENT_CONTROLLER]
+
+# ── RAG colour map ─────────────────────────────────────────────────────────────
+# Canonical hex values used in tiles and inline styles across all pages.
+RAG_COLOR_MAP = {"RED": "#ef4444", "AMBER": "#f59e0b", "GREEN": "#22c55e"}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PERSISTENCE HELPERS
@@ -537,52 +549,49 @@ def log_edit(username: str, mdr_id: str, field: str, old_val, new_val):
         _log("ERROR", f"Failed to write edit log: {e}")
 
 
-def save_mdr(df: pd.DataFrame):
-    """Write the MDR DataFrame back to CSV, persisting any edits the user made.
-
-    Date columns need special handling: pandas stores dates as Python datetime
-    objects in memory, but CSV is plain text. If we wrote them directly, they'd
-    appear as a long internal format like '2026-05-08 00:00:00'. Converting to
-    str() first gives clean ISO format: '2026-05-08'.
+def save_csv(df: pd.DataFrame, path: Path, label: str, date_cols: list[str] | None = None):
+    """Write a DataFrame to CSV — shared by save_mdr() and save_dq_flags().
 
     Args:
-        df: The full MDR DataFrame, including any rows the user has edited.
+        df:        DataFrame to write (a copy is made internally).
+        path:      Destination CSV path.
+        label:     Short name for log/error messages, e.g. "MDR", "DQ flags".
+        date_cols: Columns holding datetime objects that must be str()-converted
+                   before writing so the CSV stays human-readable.
     """
-    _log("SAVE", f"Writing {len(df)} rows to {MDR_CSV}")
-
-    # These columns hold Python datetime objects — convert to plain strings for CSV
-    date_cols = ["planned_submission_date", "planned_approval_date",
-                 "baseline_approval_date", "previous_approval_date"]
+    _log("SAVE", f"Writing {len(df)} rows to {path}")
     out = df.copy()
-    for col in date_cols:
-        if col in out.columns:
-            out[col] = out[col].astype(str)
-
+    if date_cols:
+        for col in date_cols:
+            if col in out.columns:
+                out[col] = out[col].astype(str)
     try:
-        out.to_csv(MDR_CSV, index=False)
-        _log("SAVE", "MDR CSV updated successfully")
+        out.to_csv(path, index=False)
+        _log("SAVE", f"{label} CSV updated successfully")
     except Exception as e:
-        _log("ERROR", f"Failed to write MDR CSV: {e}")
-        st.error(f"Could not save changes: {e}")
+        _log("ERROR", f"Failed to write {label} CSV: {e}")
+        st.error(f"Could not save {label}: {e}")
+
+
+def save_mdr(df: pd.DataFrame):
+    """Persist MDR edits to CSV. Date columns are serialised to ISO strings.
+
+    Args:
+        df: Full MDR DataFrame including any user edits.
+    """
+    save_csv(df, MDR_CSV, "MDR", date_cols=[
+        "planned_submission_date", "planned_approval_date",
+        "baseline_approval_date", "previous_approval_date",
+    ])
 
 
 def save_dq_flags(dq: pd.DataFrame):
-    """Write the updated DQ flags DataFrame back to staged_dq_flags.csv.
-
-    Called when a Document Controller marks one or more flags as resolved.
-    The resolved, resolved_by, and resolved_at columns are updated in memory
-    before this function is called, so the full DataFrame (all rows) is written.
+    """Persist DC-resolved DQ flags to CSV.
 
     Args:
-        dq: The full DQ flags DataFrame, with resolved status already updated.
+        dq: Full DQ flags DataFrame with resolved/resolved_by/resolved_at updated.
     """
-    _log("SAVE", f"Writing {len(dq)} DQ flag rows to {DQ_FLAGS_CSV}")
-    try:
-        dq.to_csv(DQ_FLAGS_CSV, index=False)
-        _log("SAVE", "DQ flags CSV updated successfully")
-    except Exception as e:
-        _log("ERROR", f"Failed to write DQ flags CSV: {e}")
-        st.error(f"Could not save DQ flag changes: {e}")
+    save_csv(dq, DQ_FLAGS_CSV, "DQ flags")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -749,22 +758,14 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
         )
 
         # ── Role selector ──────────────────────────────────────────────────────
-        # Three roles gate which edits are permitted across the dashboard.
-        # No login is required — this is a demo-friendly toggle.
-        #
-        #   Read Only          — view everything, edit nothing
-        #   Project Manager    — edit priority / critical path / % complete / notes
-        #   Document Controller — resolve DQ flags in the remediation queue
         st.markdown('<div class="sidebar-section">Active Role</div>', unsafe_allow_html=True)
         active_role = st.radio(
             "Role",
-            ["Read Only", "Project Manager", "Document Controller"],
+            ROLES,
             index=0,
             label_visibility="collapsed",
             key="active_role",
         )
-        # Mirror into session_state so any page can read it without an extra parameter
-        st.session_state["active_role"] = active_role
 
         st.divider()
 
@@ -1058,9 +1059,9 @@ def page_overview(df: pd.DataFrame, current_user: str):
             <div style="background:#1e2333; border:1px solid #2a3040; border-radius:4px; padding:0.85rem 1rem;">
                 <div style="font-family:'IBM Plex Mono',monospace; font-size:0.65rem; letter-spacing:0.1em; color:#7a8499; text-transform:uppercase; margin-bottom:0.5rem;">{row['discipline']}</div>
                 <div style="display:flex; gap:0.75rem; align-items:baseline; margin-bottom:0.4rem;">
-                    <span style="color:#ef4444; font-family:'IBM Plex Mono',monospace; font-weight:600;">{int(row['red'])}</span>
-                    <span style="color:#f59e0b; font-family:'IBM Plex Mono',monospace; font-weight:600;">{int(row['amber'])}</span>
-                    <span style="color:#22c55e; font-family:'IBM Plex Mono',monospace; font-weight:600;">{int(row['green'])}</span>
+                    <span style="color:{RAG_COLOR_MAP['RED']}; font-family:'IBM Plex Mono',monospace; font-weight:600;">{int(row['red'])}</span>
+                    <span style="color:{RAG_COLOR_MAP['AMBER']}; font-family:'IBM Plex Mono',monospace; font-weight:600;">{int(row['amber'])}</span>
+                    <span style="color:{RAG_COLOR_MAP['GREEN']}; font-family:'IBM Plex Mono',monospace; font-weight:600;">{int(row['green'])}</span>
                     <span style="color:#4a5568; font-size:0.7rem;">/ {int(row['total'])}</span>
                 </div>
                 <div style="font-size:0.68rem; color:#4a5568; font-family:'IBM Plex Mono',monospace;">
@@ -1130,7 +1131,7 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     # ── Column selector ───────────────────────────────────────────────────────
     # Only Project Managers can write PM_UPDATE events (priority, critical path,
     # percent complete, notes). All other roles get disabled columns.
-    can_edit_mdr  = (active_role == "Project Manager")
+    can_edit_mdr  = (active_role == ROLE_PROJECT_MANAGER)
     EDITABLE_COLS = ["is_on_critical_path", "priority", "reported_percent_complete", "notes"]
     ALL_OPTIONAL  = [
         "document_title", "discipline", "priority", "rag_status", "is_on_critical_path",
@@ -1199,7 +1200,7 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     # ── Editable table ────────────────────────────────────────────────────────
     # Show a banner when the user cannot edit — explains why the fields appear greyed out
     if not can_edit_mdr:
-        st.info("Read Only — switch to Project Manager in the sidebar to edit priority, critical path, percent complete, and notes.")
+        st.info(f"Read Only — switch to {ROLE_PROJECT_MANAGER} in the sidebar to edit priority, critical path, percent complete, and notes.")
 
     edited_df = st.data_editor(
         display_df,
@@ -1349,24 +1350,16 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
     # ── Section 1: Per-source summary tiles ───────────────────────────────────
     st.markdown('<div class="section-header">Source System Overview</div>', unsafe_allow_html=True)
 
-    # Record counts come from the MDR (one row per document, with source_system field)
-    src_record_counts = df.groupby("source_system").size().rename("records")
+    # Precompute filter masks once so groupby calls below don't repeat the boolean ops
+    unresolved_dq = dq_raw[~dq_raw["resolved"]]
+    missing_dq    = unresolved_dq[unresolved_dq["flag_type"] == "MISSING_MANDATORY_FIELD"]
 
-    # DQ flag counts per source system
-    total_by_src  = dq_raw.groupby("source_system").size().rename("total_flags")
-    unres_by_src  = (
-        dq_raw[~dq_raw["resolved"]]
-        .groupby("source_system").size().rename("unresolved")
-    )
-    # Missing mandatory field flags are the most critical — they breach ISO 19650 requirements
-    missing_by_src = (
-        dq_raw[~dq_raw["resolved"] & (dq_raw["flag_type"] == "MISSING_MANDATORY_FIELD")]
-        .groupby("source_system").size().rename("missing_fields")
-    )
-
-    # Combine into one summary DataFrame, filling zeros for sources with no flags
-    summary = pd.concat([src_record_counts, total_by_src, unres_by_src, missing_by_src], axis=1)
-    summary = summary.fillna(0).astype(int).reset_index()
+    summary = pd.concat([
+        df.groupby("source_system").size().rename("records"),
+        dq_raw.groupby("source_system").size().rename("total_flags"),
+        unresolved_dq.groupby("source_system").size().rename("unresolved"),
+        missing_dq.groupby("source_system").size().rename("missing_fields"),
+    ], axis=1).fillna(0).astype(int).reset_index()
     summary.rename(columns={"source_system": "source"}, inplace=True)
 
     # RAG logic per source:
@@ -1384,9 +1377,8 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
 
     # Display one tile per source system, styled to match the rest of the dashboard
     tile_cols = st.columns(len(summary))
-    rag_colors = {"RED": "#ef4444", "AMBER": "#f59e0b", "GREEN": "#22c55e"}
     for i, row in summary.iterrows():
-        color = rag_colors[row["rag"]]
+        color = RAG_COLOR_MAP[row["rag"]]
         with tile_cols[i]:
             st.markdown(
                 f"""
@@ -1417,11 +1409,11 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
     st.markdown('<div class="section-header">Remediation Queue — Unresolved Flags</div>', unsafe_allow_html=True)
 
     # Role notice — only DCs can mark flags as resolved
-    is_dc = (active_role == "Document Controller")
+    is_dc = (active_role == ROLE_DOCUMENT_CONTROLLER)
     if is_dc:
-        st.success("Document Controller — tick the 'Resolved' checkbox to mark a flag as fixed.")
+        st.success(f"{ROLE_DOCUMENT_CONTROLLER} — tick the 'Resolved' checkbox to mark a flag as fixed.")
     else:
-        st.info("Read Only — switch to Document Controller in the sidebar to resolve DQ flags.")
+        st.info(f"Read Only — switch to {ROLE_DOCUMENT_CONTROLLER} in the sidebar to resolve DQ flags.")
 
     # ── Filter controls ───────────────────────────────────────────────────────
     fc1, fc2, _ = st.columns([2, 3, 3])
@@ -1482,28 +1474,21 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
 
     # ── Persist resolved changes (DC only) ────────────────────────────────────
     if is_dc:
-        # Detect any checkbox that changed from False to True in this render cycle
+        # queue only shows unresolved flags, so any checkbox change is False -> True.
         changed = ~(queue_orig["resolved"].eq(edited_queue["resolved"]))
         if changed.any():
             now_str = str(datetime.now(timezone.utc))
-            newly_resolved_count = 0
             for i, row in edited_queue[changed].iterrows():
-                flag_id     = row["flag_id"]
-                new_resolved = bool(row["resolved"])
-                if new_resolved:
-                    # Update the master DQ flags table in memory
-                    mask = dq_raw["flag_id"] == flag_id
-                    dq_raw.loc[mask, "resolved"]    = True
-                    dq_raw.loc[mask, "resolved_by"] = current_user
-                    dq_raw.loc[mask, "resolved_at"] = now_str
-                    # Write an audit record — same mechanism as PM_UPDATE edits
-                    log_edit(current_user, row["mdr_id"], f"dq_flag_resolved:{flag_id}", "False", "True")
-                    _log("EDIT", f"DC {current_user} resolved flag {flag_id} on {row['mdr_id']}")
-                    newly_resolved_count += 1
-            if newly_resolved_count:
-                save_dq_flags(dq_raw)
-                st.toast(f"{newly_resolved_count} flag(s) marked as resolved.", icon="✅")
-                st.rerun()
+                flag_id = row["flag_id"]
+                mask = dq_raw["flag_id"] == flag_id
+                dq_raw.loc[mask, "resolved"]    = True
+                dq_raw.loc[mask, "resolved_by"] = current_user
+                dq_raw.loc[mask, "resolved_at"] = now_str
+                log_edit(current_user, row["mdr_id"], f"dq_flag_resolved:{flag_id}", "False", "True")
+                _log("EDIT", f"DC {current_user} resolved flag {flag_id} on {row['mdr_id']}")
+            save_dq_flags(dq_raw)
+            st.toast(f"{changed.sum()} flag(s) marked as resolved.", icon="✅")
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

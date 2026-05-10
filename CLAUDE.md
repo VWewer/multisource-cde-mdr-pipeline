@@ -204,6 +204,29 @@ Per source system, the page shows:
 | Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller |
 | Source System Health page | ✅ Complete | Per-source RAG tiles, DC remediation queue, mark-resolved with audit log |
 
+## Code architecture — key module-level constants (app.py)
+
+These are defined once near the top of `dashboard/app.py` and must be used everywhere
+in place of raw string literals:
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `ROLE_READ_ONLY` | `"Read Only"` | Role gate — view only |
+| `ROLE_PROJECT_MANAGER` | `"Project Manager"` | Role gate — PM edits |
+| `ROLE_DOCUMENT_CONTROLLER` | `"Document Controller"` | Role gate — DC remediation |
+| `ROLES` | list of the three above | Passed directly to `st.radio()` |
+| `RAG_COLOR_MAP` | `{"RED": "#ef4444", ...}` | Single source of truth for RAG hex colours |
+
+**Key shared helpers:**
+
+| Helper | Purpose |
+|---|---|
+| `save_csv(df, path, label, date_cols)` | Generic CSV write with logging and error display. Used by `save_mdr()` and `save_dq_flags()` |
+| `save_mdr(df)` | Thin wrapper — calls `save_csv` with MDR date columns |
+| `save_dq_flags(dq)` | Thin wrapper — calls `save_csv` with no date columns |
+| `log_edit(user, mdr_id, field, old, new)` | Audit trail append — used for both PM_UPDATE and DQ_REMEDIATION events |
+| `_log(label, msg)` | Terminal lifecycle log — every key event must call this |
+
 ## Next session — start here
 
 **Remaining stub pages:**
