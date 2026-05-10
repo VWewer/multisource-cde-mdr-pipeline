@@ -13,6 +13,22 @@ through a data pipeline, and surfaced in a Streamlit dashboard.
 
 **Primary audience:** Recruitment / technical interviews at Siemens Energy, Accenture, CE-RISE.
 
+**Three-signal portfolio strategy:**
+- **Video** — recruiter-facing: explains the business problem and value in plain language
+- **Live dashboard** — hiring manager-facing: demonstrates domain knowledge and product thinking
+- **Source code** — technical interviewer-facing: demonstrates pipeline architecture and engineering judgment
+
+**60-second pitch (memorise this):**
+> Large CAPEX projects run across multiple document systems that do not talk to each other.
+> Missing traceability and data ambiguity cause delays and cost overruns that are entirely preventable.
+> This pipeline simulates that problem: three source systems — Windchill, SharePoint, Aveva — each
+> with distinct schemas, naming conventions, and data quality issues. The STAGED layer harmonises
+> them into a single canonical record following ISO 19650, assigns each document a stable identifier
+> regardless of what the source system calls it, and flags quality issues before they reach any user.
+> The dashboard gives a Document Controller a remediation queue for those flags, and a Project Manager
+> visibility on delivery, critical path, and completion. Every edit is written as an immutable event —
+> full traceability, no overwriting.
+
 ---
 
 ## Tech stack
@@ -33,26 +49,136 @@ through a data pipeline, and surfaced in a Streamlit dashboard.
 
 ```
 multisource-cde-mdr-pipeline/
-├── CLAUDE.md                          ← you are here
+├── CLAUDE.md                             ← you are here
 ├── README.md
-├── .env                               ← real credentials — gitignored, never commit
-├── .env.example                       ← placeholder values — committed
+├── .env                                  ← real credentials — gitignored, never commit
+├── .env.example                          ← placeholder values — committed
 ├── requirements.txt
 ├── data_generation/
-│   ├── generate_raw_layer.py          ← Day 2: creates raw_documents.csv
-│   ├── generate_staged_layer.py       ← Day 2: creates staged_events.csv
-│   ├── generate_mdr_layer.py          ← Day 2: creates mdr_requirements.csv
-│   ├── load_to_snowflake.py           ← Day 2: pushes all CSVs to Snowflake
-│   ├── raw_documents.csv              ← generated output (60 rows)
-│   ├── staged_events.csv              ← generated output (~471 rows)
-│   └── mdr_requirements.csv          ← source of truth for dashboard edits
+│   │
+│   │   SOURCE GENERATORS (v2) — run first, produce source-native CSVs
+│   ├── generate_windchill_source.py      ← Windchill-native schema (ISO dates, MECH codes, A/B/C revisions)
+│   ├── generate_sharepoint_source.py     ← SharePoint-native schema (MM/DD/YYYY, verbose depts, 1.0/2.0 versions)
+│   ├── generate_aveva_source.py          ← Aveva-native schema (DD.MM.YYYY, I&C, numeric revisions 0/1/2)
+│   ├── windchill_source.csv              ← generated output (30 rows, source-native)
+│   ├── sharepoint_source.csv             ← generated output (20 rows, source-native)
+│   ├── aveva_source.csv                  ← generated output (10 rows, source-native)
+│   │
+│   │   STAGED LAYER (v2) — reads the three source CSVs, harmonises, detects DQ issues
+│   ├── generate_staged_layer.py          ← harmonisation engine
+│   ├── staged_events.csv                 ← event log (~471 rows, canonical schema)
+│   ├── staged_cross_reference.csv        ← source_id -> mdr_id mapping (golden record table)
+│   ├── staged_dq_flags.csv               ← data quality issues flagged at pipeline time
+│   │
+│   │   ANALYTICAL LAYER — reads staged outputs
+│   ├── generate_mdr_layer.py             ← builds MDR register from harmonised data
+│   ├── mdr_requirements.csv              ← source of truth for dashboard edits (60 rows)
+│   │
+│   │   LOAD
+│   ├── load_to_snowflake.py              ← pushes all CSVs to Snowflake
+│   │
+│   │   LEGACY (v1) — kept for reference, superseded by v2 source generators
+│   └── generate_raw_layer.py             ← LEGACY: monolithic generator, single schema
+│
 ├── dashboard/
-│   ├── app.py                         ← Streamlit dashboard (main file)
-│   ├── edit_log.csv                   ← audit trail — append only, never delete
-│   ├── bookmarks.csv                  ← per-user watchlist
-│   └── saved_views.json               ← named saved views
-└── sql/                               ← SQL reference scripts (not executed by app)
+│   ├── app.py                            ← Streamlit dashboard (main file)
+│   ├── edit_log.csv                      ← audit trail — append only, never delete
+│   ├── bookmarks.csv                     ← per-user watchlist
+│   └── saved_views.json                  ← named saved views
+└── sql/                                  ← SQL reference scripts (not executed by app)
 ```
+
+---
+
+## Architecture design decisions (v2 — established 2026-05-10)
+
+These decisions were stress-tested in a structured design review. Do not change them without good reason.
+
+### Pipeline architecture
+
+The pipeline has three distinct layers with deliberate separation of concerns:
+
+```
+SOURCE SYSTEMS          STAGED (harmonisation)        ANALYTICAL
+windchill_source.csv  ──┐
+sharepoint_source.csv ──┤── generate_staged_layer.py ──► staged_events.csv
+aveva_source.csv      ──┘                              ► staged_cross_reference.csv
+                                                       ► staged_dq_flags.csv
+                                                              │
+                                                      generate_mdr_layer.py
+                                                              │
+                                                       mdr_requirements.csv
+```
+
+**Key principle:** Data quality detection is a pipeline responsibility, not a dashboard responsibility.
+By the time a user sees a record, it is already classified, flagged, and queued. The dashboard
+is a remediation tool, not an inspection tool.
+
+### Source system schemas — intentional differences
+
+Each source system produces source-native field names and formats. These differences are the
+pipeline problem the STAGED layer exists to solve.
+
+| Property | Windchill | SharePoint | Aveva |
+|---|---|---|---|
+| Document ID field | `wc_doc_id` | `sp_item_id` | `aveva_id` |
+| Status field | `wc_lifecycle_state` | `sp_status` | `aveva_document_status` |
+| Revision field | `wc_revision` (A/B/C) | `sp_version` (1.0/2.0) | `aveva_revision_no` (0/1/2) |
+| Date format | ISO 8601 (2025-01-15T09:23Z) | MM/DD/YYYY (01/15/2025) | DD.MM.YYYY (15.01.2025) |
+| Discipline field | `wc_discipline_code` (MECH/ELEC) | `sp_department` (Mechanical Engineering) | `aveva_discipline` (I&C) |
+| Confidentiality vocab | Internal/Restricted/Confidential | Public/Internal Use Only/Confidential | Unrestricted/Restricted/Confidential/Highly Confidential |
+
+### Injected data quality issues (deliberate, for demo)
+
+| Issue | Source | Field | DQ Flag type |
+|---|---|---|---|
+| Missing author (~3 records) | Windchill | `wc_author` | MISSING_MANDATORY_FIELD |
+| Non-standard discipline code (~2 records) | Windchill | `wc_discipline_code` = "MECHANICAL" | NORMALISATION_REQUIRED |
+| Missing created_by (~2 records) | SharePoint | `sp_created_by` | MISSING_MANDATORY_FIELD |
+| Missing company (~2 records) | SharePoint | `sp_company` | MISSING_MANDATORY_FIELD |
+| Missing prepared_by (~1 record) | Aveva | `aveva_prepared_by` | MISSING_MANDATORY_FIELD |
+| I&C discipline code (~all Aveva Instrumentation) | Aveva | `aveva_discipline` = "I&C" | NORMALISATION_REQUIRED |
+| Cross-system duplicates (~2 pairs) | WC + SP | same document, different IDs | DUPLICATE_CANDIDATE |
+
+### Canonical ID — ISO 19650 construction rule
+
+Format: `{PROJECT}-{ORIGINATOR}-{VOLUME}-{TYPE}-{DISCIPLINE}-{SEQUENCE}`
+Example: `PROJ1-ALPHAENG-ZZ-DR-ME-000042`
+
+**Rules:**
+- Assigned ONCE in the STAGED layer. Never changes.
+- Revision, status, and confidentiality are ATTRIBUTES on the event record — not part of the ID.
+- The cross-reference table (`staged_cross_reference.csv`) maps `(source_system, source_native_id) → mdr_id`.
+- If a source system renumbers its documents, update the cross-reference. The canonical ID is immutable.
+
+### Event types in STAGED
+
+Two distinct event types, written by two distinct roles:
+
+| Event type | Written by | Trigger |
+|---|---|---|
+| `PM_UPDATE` | Project Manager | Edit to priority / critical path / percent complete / notes |
+| `DQ_REMEDIATION` | Document Controller | Fill missing field / confirm duplicate / normalisation override |
+
+Both are immutable appends. No record is ever overwritten. Full audit trail always recoverable.
+
+### Dashboard roles
+
+Three-state radio selector in sidebar (no credentials required — demo-friendly):
+
+| Role | Can do |
+|---|---|
+| Read Only (default) | View all pages, no edits |
+| Project Manager | Edit priority, critical path, percent complete, notes → writes PM_UPDATE event |
+| Document Controller | Resolve DQ flags in remediation queue → writes DQ_REMEDIATION event |
+
+### Source System Health page (purpose)
+
+Per source system, the page shows:
+- Record count and last ingestion timestamp
+- DQ issue count by type (missing field / normalisation / duplicate candidate / timestamp parse error)
+- RAG status per source system
+- Drilldown table of flagged records awaiting DC resolution
 
 ---
 
@@ -64,19 +190,27 @@ multisource-cde-mdr-pipeline/
 | MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views |
 | My Watchlist | 🔲 Stub | Shows bookmarks df only — full build pending |
 | Document Detail | 🔲 Stub | Shows JSON row only — STAGED timeline pending |
-| Source System Health | 🔲 Stub | Placeholder only |
+| Source System Health | 🔲 Planned | Per-source RAG, DQ flag counts, DC remediation queue — design complete, build pending |
 
 ---
 
 ## How to run
 
-### Generate data (run once, in this order)
+### Generate data — v2 pipeline (run in this order)
 ```powershell
 cd data_generation
-python generate_raw_layer.py
-python generate_staged_layer.py
-python generate_mdr_layer.py
-python load_to_snowflake.py
+python generate_windchill_source.py    # produces windchill_source.csv
+python generate_sharepoint_source.py   # produces sharepoint_source.csv
+python generate_aveva_source.py        # produces aveva_source.csv
+python generate_staged_layer.py        # reads 3 sources, produces staged_events + cross_ref + dq_flags
+python generate_mdr_layer.py           # reads staged outputs, produces mdr_requirements.csv
+python load_to_snowflake.py            # pushes all CSVs to Snowflake
+```
+
+### Generate data — v1 legacy (original single-generator pipeline)
+```powershell
+cd data_generation
+python generate_raw_layer.py           # LEGACY — kept for reference only
 ```
 
 ### Launch the dashboard
@@ -170,13 +304,23 @@ The terminal will print extra detail on every lifecycle event.
 
 ## Data model quick reference
 
-| Layer       | Table / File                  | Rows  | Where          |
-|-------------|-------------------------------|-------|----------------|
-| RAW         | `RAW.DOCUMENTS`               | 60    | Snowflake       |
-| STAGED      | `STAGED.EVENTS`               | ~471  | Snowflake       |
-| ANALYTICAL  | `ANALYTICAL.MDR_REQUIREMENTS` | 60    | Snowflake + CSV |
+| Layer | Table / File | Rows | Where |
+|---|---|---|---|
+| SOURCE | `windchill_source.csv` | 30 | CSV only |
+| SOURCE | `sharepoint_source.csv` | 20 | CSV only |
+| SOURCE | `aveva_source.csv` | 10 | CSV only |
+| STAGED | `STAGED.EVENTS` / `staged_events.csv` | ~471 | Snowflake + CSV |
+| STAGED | `staged_cross_reference.csv` | 60 | CSV only |
+| STAGED | `staged_dq_flags.csv` | ~15 | CSV only |
+| ANALYTICAL | `ANALYTICAL.MDR_REQUIREMENTS` / `mdr_requirements.csv` | 60 | Snowflake + CSV |
 
 **Source of truth for dashboard edits:** `data_generation/mdr_requirements.csv`
+
+**Golden record table:** `data_generation/staged_cross_reference.csv`
+Maps `(source_system, source_native_id) → mdr_id`. Never deleted. Used for full lineage tracing.
+
+**DQ flags table:** `data_generation/staged_dq_flags.csv`
+Populated at pipeline run time. Read by Source System Health page. Resolved by Document Controller.
 
 ### Editable fields in the dashboard
 | Field                      | Widget         | Effect                          |
