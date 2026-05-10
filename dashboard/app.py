@@ -36,6 +36,7 @@ MDR_CSV        = DATA_DIR / "mdr_requirements.csv"
 EDIT_LOG_CSV   = DASHBOARD_DIR / "edit_log.csv"
 BOOKMARKS_CSV  = DASHBOARD_DIR / "bookmarks.csv"
 SAVED_VIEWS_JSON = DASHBOARD_DIR / "saved_views.json"
+DQ_FLAGS_CSV     = DATA_DIR / "staged_dq_flags.csv"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -565,6 +566,25 @@ def save_mdr(df: pd.DataFrame):
         st.error(f"Could not save changes: {e}")
 
 
+def save_dq_flags(dq: pd.DataFrame):
+    """Write the updated DQ flags DataFrame back to staged_dq_flags.csv.
+
+    Called when a Document Controller marks one or more flags as resolved.
+    The resolved, resolved_by, and resolved_at columns are updated in memory
+    before this function is called, so the full DataFrame (all rows) is written.
+
+    Args:
+        dq: The full DQ flags DataFrame, with resolved status already updated.
+    """
+    _log("SAVE", f"Writing {len(dq)} DQ flag rows to {DQ_FLAGS_CSV}")
+    try:
+        dq.to_csv(DQ_FLAGS_CSV, index=False)
+        _log("SAVE", "DQ flags CSV updated successfully")
+    except Exception as e:
+        _log("ERROR", f"Failed to write DQ flags CSV: {e}")
+        st.error(f"Could not save DQ flag changes: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SNOWFLAKE HELPER (read-only — RAW + STAGED)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -702,8 +722,8 @@ def gk_bar_color(count: int, max_count: int) -> str:
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None]:
-    """Renders sidebar. Returns (current_user, active_saved_view_name | None)."""
+def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
+    """Renders sidebar. Returns (current_user, active_saved_view_name | None, active_role)."""
 
     with st.sidebar:
         st.markdown('<div class="sidebar-logo">📋 MDR Control · PROJ1</div>', unsafe_allow_html=True)
@@ -727,6 +747,24 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None]:
             f'<div class="user-role">{u["role"]}</div>',
             unsafe_allow_html=True
         )
+
+        # ── Role selector ──────────────────────────────────────────────────────
+        # Three roles gate which edits are permitted across the dashboard.
+        # No login is required — this is a demo-friendly toggle.
+        #
+        #   Read Only          — view everything, edit nothing
+        #   Project Manager    — edit priority / critical path / % complete / notes
+        #   Document Controller — resolve DQ flags in the remediation queue
+        st.markdown('<div class="sidebar-section">Active Role</div>', unsafe_allow_html=True)
+        active_role = st.radio(
+            "Role",
+            ["Read Only", "Project Manager", "Document Controller"],
+            index=0,
+            label_visibility="collapsed",
+            key="active_role",
+        )
+        # Mirror into session_state so any page can read it without an extra parameter
+        st.session_state["active_role"] = active_role
 
         st.divider()
 
@@ -800,7 +838,7 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None]:
             unsafe_allow_html=True
         )
 
-    return current_user, active_view
+    return current_user, active_view, active_role
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1036,7 +1074,7 @@ def page_overview(df: pd.DataFrame, current_user: str):
 # PAGE STUBS (Day 4+)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | None):  # noqa: C901
+def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | None, active_role: str = "Read Only"):  # noqa: C901
     st.markdown('<div class="page-title">MDR Register</div>', unsafe_allow_html=True)
 
     # Load saved view defaults
@@ -1090,6 +1128,9 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     ))
 
     # ── Column selector ───────────────────────────────────────────────────────
+    # Only Project Managers can write PM_UPDATE events (priority, critical path,
+    # percent complete, notes). All other roles get disabled columns.
+    can_edit_mdr  = (active_role == "Project Manager")
     EDITABLE_COLS = ["is_on_critical_path", "priority", "reported_percent_complete", "notes"]
     ALL_OPTIONAL  = [
         "document_title", "discipline", "priority", "rag_status", "is_on_critical_path",
@@ -1139,9 +1180,9 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         "bookmarked":                st.column_config.CheckboxColumn("⭐", width="small", help="Add to My Watchlist"),
         "document_title":            st.column_config.TextColumn("Title", width="large", disabled=True),
         "discipline":                st.column_config.TextColumn("Discipline", disabled=True),
-        "priority":                  st.column_config.SelectboxColumn("Priority", options=["Very High", "High", "Medium", "Low"]),
+        "priority":                  st.column_config.SelectboxColumn("Priority", options=["Very High", "High", "Medium", "Low"], disabled=not can_edit_mdr),
         "rag_status":                st.column_config.TextColumn("RAG", width="small", disabled=True),
-        "is_on_critical_path":       st.column_config.CheckboxColumn("Crit. Path"),
+        "is_on_critical_path":       st.column_config.CheckboxColumn("Crit. Path", disabled=not can_edit_mdr),
         "schedule_float_days":       st.column_config.NumberColumn("Float (d)", format="%d", disabled=True),
         "date_trend":                st.column_config.TextColumn("Trend", width="small", disabled=True),
         "current_canonical_status":  st.column_config.TextColumn("Status", disabled=True),
@@ -1149,13 +1190,17 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         "planned_approval_date":     st.column_config.DateColumn("Planned Approval", disabled=True),
         "total_slip_days":           st.column_config.NumberColumn("Slip (d)", format="%d", disabled=True),
         "responsible_person":        st.column_config.TextColumn("Responsible", disabled=True),
-        "reported_percent_complete": st.column_config.NumberColumn("% Complete", min_value=0, max_value=100, step=5, format="%d%%"),
+        "reported_percent_complete": st.column_config.NumberColumn("% Complete", min_value=0, max_value=100, step=5, format="%d%%", disabled=not can_edit_mdr),
         "derived_percent_complete":  st.column_config.NumberColumn("% Complete (auto)", format="%.0f%%", disabled=True),
         "source_system":             st.column_config.TextColumn("Source System", disabled=True),
-        "notes":                     st.column_config.TextColumn("Notes", width="large"),
+        "notes":                     st.column_config.TextColumn("Notes", width="large", disabled=not can_edit_mdr),
     }
 
     # ── Editable table ────────────────────────────────────────────────────────
+    # Show a banner when the user cannot edit — explains why the fields appear greyed out
+    if not can_edit_mdr:
+        st.info("Read Only — switch to Project Manager in the sidebar to edit priority, critical path, percent complete, and notes.")
+
     edited_df = st.data_editor(
         display_df,
         column_config=col_cfg,
@@ -1266,9 +1311,199 @@ def page_document_detail(df: pd.DataFrame, current_user: str):
     st.info("🚧 Full detail view with STAGED timeline — to be built Day 4.")
 
 
-def page_source_health(df: pd.DataFrame):
-    st.markdown('<div class="page-title">Source System Health</div>', unsafe_allow_html=True)
-    st.info("🚧 Source system health view — to be built Day 4.")
+def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
+    """Source System Health page.
+
+    Shows per-source RAG status, DQ flag counts, and a Document Controller
+    remediation queue for unresolved flags. DCs can tick 'resolved' to mark
+    a flag as fixed, which writes resolved_by and resolved_at to the CSV and
+    logs a DQ_REMEDIATION event to the audit trail.
+
+    Args:
+        df:           Full MDR DataFrame — used for record counts per source.
+        current_user: Currently active mock user (for audit logging).
+        active_role:  "Read Only", "Project Manager", or "Document Controller".
+    """
+    st.markdown('<div class="page-title">Source System Health — Pipeline Ingestion Status</div>', unsafe_allow_html=True)
+
+    # ── Load DQ flags ──────────────────────────────────────────────────────────
+    if not DQ_FLAGS_CSV.exists():
+        _log("ERROR", f"DQ flags CSV not found at {DQ_FLAGS_CSV}")
+        st.error(
+            "DQ flags file not found. Run data_generation/generate_staged_layer.py first "
+            "to populate staged_dq_flags.csv."
+        )
+        return
+
+    _log("LOAD", f"Reading DQ flags from {DQ_FLAGS_CSV}")
+    dq_raw = pd.read_csv(DQ_FLAGS_CSV)
+
+    # The 'resolved' column is stored as the string "True"/"False" in CSV.
+    # We normalise it to a Python bool so comparisons and filtering work correctly.
+    dq_raw["resolved"] = dq_raw["resolved"].astype(str).str.lower() == "true"
+
+    n_total    = len(dq_raw)
+    n_resolved = int(dq_raw["resolved"].sum())
+    _log("LOAD", f"DQ flags loaded — {n_total} total, {n_resolved} resolved, {n_total - n_resolved} open")
+
+    # ── Section 1: Per-source summary tiles ───────────────────────────────────
+    st.markdown('<div class="section-header">Source System Overview</div>', unsafe_allow_html=True)
+
+    # Record counts come from the MDR (one row per document, with source_system field)
+    src_record_counts = df.groupby("source_system").size().rename("records")
+
+    # DQ flag counts per source system
+    total_by_src  = dq_raw.groupby("source_system").size().rename("total_flags")
+    unres_by_src  = (
+        dq_raw[~dq_raw["resolved"]]
+        .groupby("source_system").size().rename("unresolved")
+    )
+    # Missing mandatory field flags are the most critical — they breach ISO 19650 requirements
+    missing_by_src = (
+        dq_raw[~dq_raw["resolved"] & (dq_raw["flag_type"] == "MISSING_MANDATORY_FIELD")]
+        .groupby("source_system").size().rename("missing_fields")
+    )
+
+    # Combine into one summary DataFrame, filling zeros for sources with no flags
+    summary = pd.concat([src_record_counts, total_by_src, unres_by_src, missing_by_src], axis=1)
+    summary = summary.fillna(0).astype(int).reset_index()
+    summary.rename(columns={"source_system": "source"}, inplace=True)
+
+    # RAG logic per source:
+    #   RED   = unresolved MISSING_MANDATORY_FIELD flags (ISO 19650 breach)
+    #   AMBER = other unresolved flags (normalisation / format issues)
+    #   GREEN = all flags resolved (or no flags at all)
+    def _rag(row):
+        if row["missing_fields"] > 0:
+            return "RED"
+        if row["unresolved"] > 0:
+            return "AMBER"
+        return "GREEN"
+
+    summary["rag"] = summary.apply(_rag, axis=1)
+
+    # Display one tile per source system, styled to match the rest of the dashboard
+    tile_cols = st.columns(len(summary))
+    rag_colors = {"RED": "#ef4444", "AMBER": "#f59e0b", "GREEN": "#22c55e"}
+    for i, row in summary.iterrows():
+        color = rag_colors[row["rag"]]
+        with tile_cols[i]:
+            st.markdown(
+                f"""
+                <div style="background:#1e2333; border:1px solid #2a3040;
+                            border-top:3px solid {color}; border-radius:4px;
+                            padding:1rem 1.25rem; margin-bottom:0.75rem;">
+                  <div style="font-family:'IBM Plex Mono',monospace; font-size:1.6rem;
+                              font-weight:600; color:{color}; margin-bottom:0.25rem;">
+                    {row['rag']}
+                  </div>
+                  <div style="font-size:0.9rem; font-weight:600; color:#e8ecf4;
+                              margin-bottom:0.5rem;">
+                    {row['source']}
+                  </div>
+                  <div style="font-size:0.72rem; color:#7a8499;
+                              font-family:'IBM Plex Mono',monospace; line-height:1.8;">
+                    Records ingested: {row['records']}<br>
+                    Total DQ flags: {row['total_flags']}<br>
+                    Unresolved flags: {row['unresolved']}<br>
+                    Missing mandatory fields: {row['missing_fields']}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # ── Section 2: Remediation queue ─────────────────────────────────────────
+    st.markdown('<div class="section-header">Remediation Queue — Unresolved Flags</div>', unsafe_allow_html=True)
+
+    # Role notice — only DCs can mark flags as resolved
+    is_dc = (active_role == "Document Controller")
+    if is_dc:
+        st.success("Document Controller — tick the 'Resolved' checkbox to mark a flag as fixed.")
+    else:
+        st.info("Read Only — switch to Document Controller in the sidebar to resolve DQ flags.")
+
+    # ── Filter controls ───────────────────────────────────────────────────────
+    fc1, fc2, _ = st.columns([2, 3, 3])
+    src_options  = ["All"] + sorted(dq_raw["source_system"].dropna().unique().tolist())
+    type_options = ["All"] + sorted(dq_raw["flag_type"].dropna().unique().tolist())
+    sel_src  = fc1.selectbox("Source system", src_options,  key="health_src_filter")
+    sel_type = fc2.selectbox("Flag type",     type_options, key="health_type_filter")
+
+    # Always show only unresolved flags in the remediation queue
+    queue = dq_raw[~dq_raw["resolved"]].copy()
+    if sel_src  != "All":
+        queue = queue[queue["source_system"] == sel_src]
+    if sel_type != "All":
+        queue = queue[queue["flag_type"] == sel_type]
+
+    _log("FILTER", f"Health queue — src={sel_src} type={sel_type} -> {len(queue)} flags")
+
+    st.markdown(
+        f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
+        f'Showing <b>{len(queue)}</b> unresolved flags</div>',
+        unsafe_allow_html=True,
+    )
+
+    if queue.empty:
+        st.success("No unresolved flags for the selected filters — all clear.")
+        return
+
+    # ── Remediation table ─────────────────────────────────────────────────────
+    # Columns shown in the drilldown. flag_detail is last as it's the longest field.
+    QUEUE_COLS = [
+        "flag_id", "source_system", "mdr_id", "field_name",
+        "flag_type", "original_value", "suggested_value", "resolved", "flag_detail",
+    ]
+    queue_display = queue[QUEUE_COLS].reset_index(drop=True)
+    queue_orig    = queue_display.copy()  # snapshot for change detection
+
+    queue_col_cfg = {
+        "flag_id":         st.column_config.TextColumn("Flag ID",      width="small",  disabled=True),
+        "source_system":   st.column_config.TextColumn("Source",       width="small",  disabled=True),
+        "mdr_id":          st.column_config.TextColumn("MDR ID",                       disabled=True),
+        "field_name":      st.column_config.TextColumn("Field",        width="small",  disabled=True),
+        "flag_type":       st.column_config.TextColumn("Flag Type",                    disabled=True),
+        "original_value":  st.column_config.TextColumn("Original",     width="small",  disabled=True),
+        "suggested_value": st.column_config.TextColumn("Suggested",    width="small",  disabled=True),
+        # Only Document Controllers can tick this checkbox
+        "resolved":        st.column_config.CheckboxColumn("Resolved",                 disabled=not is_dc),
+        "flag_detail":     st.column_config.TextColumn("Detail",       width="large",  disabled=True),
+    }
+
+    edited_queue = st.data_editor(
+        queue_display,
+        column_config=queue_col_cfg,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="health_queue_editor",
+    )
+
+    # ── Persist resolved changes (DC only) ────────────────────────────────────
+    if is_dc:
+        # Detect any checkbox that changed from False to True in this render cycle
+        changed = ~(queue_orig["resolved"].eq(edited_queue["resolved"]))
+        if changed.any():
+            now_str = str(datetime.now(timezone.utc))
+            newly_resolved_count = 0
+            for i, row in edited_queue[changed].iterrows():
+                flag_id     = row["flag_id"]
+                new_resolved = bool(row["resolved"])
+                if new_resolved:
+                    # Update the master DQ flags table in memory
+                    mask = dq_raw["flag_id"] == flag_id
+                    dq_raw.loc[mask, "resolved"]    = True
+                    dq_raw.loc[mask, "resolved_by"] = current_user
+                    dq_raw.loc[mask, "resolved_at"] = now_str
+                    # Write an audit record — same mechanism as PM_UPDATE edits
+                    log_edit(current_user, row["mdr_id"], f"dq_flag_resolved:{flag_id}", "False", "True")
+                    _log("EDIT", f"DC {current_user} resolved flag {flag_id} on {row['mdr_id']}")
+                    newly_resolved_count += 1
+            if newly_resolved_count:
+                save_dq_flags(dq_raw)
+                st.toast(f"{newly_resolved_count} flag(s) marked as resolved.", icon="✅")
+                st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1287,8 +1522,8 @@ def main():
     # Load data
     df = load_mdr()
 
-    # Sidebar — returns active user and selected saved view
-    current_user, active_view = render_sidebar(df)
+    # Sidebar — returns active user, selected saved view, and active role
+    current_user, active_view, active_role = render_sidebar(df)
 
     # Route to page
     page = st.session_state.get("nav_page", "Overview")
@@ -1296,13 +1531,13 @@ def main():
     if page == "Overview":
         page_overview(df, current_user)
     elif page == "MDR Register":
-        page_mdr_register(df, current_user, active_view)
+        page_mdr_register(df, current_user, active_view, active_role)
     elif page == "My Watchlist":
         page_watchlist(df, current_user)
     elif page == "Document Detail":
         page_document_detail(df, current_user)
     elif page == "Source System Health":
-        page_source_health(df)
+        page_source_health(df, current_user, active_role)
 
 
 if __name__ == "__main__":

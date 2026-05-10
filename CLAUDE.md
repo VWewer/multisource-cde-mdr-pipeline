@@ -190,7 +190,7 @@ Per source system, the page shows:
 | MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views |
 | My Watchlist | 🔲 Stub | Shows bookmarks df only — full build pending |
 | Document Detail | 🔲 Stub | Shows JSON row only — STAGED timeline pending |
-| Source System Health | 🔲 Planned | Per-source RAG, DQ flag counts, DC remediation queue — design complete, build pending |
+| Source System Health | ✅ Complete | Per-source RAG tiles, unresolved flag drilldown, DC mark-resolved with audit log |
 
 ## Pipeline build status (v2)
 
@@ -201,32 +201,36 @@ Per source system, the page shows:
 | `generate_aveva_source.py` | ✅ Complete | 10 rows, source-native schema, 1 DQ issue injected |
 | `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files |
 | `generate_mdr_layer.py` | ✅ Unchanged | Still works — reads new raw_documents.csv without modification |
-| Role selector (dashboard) | 🔲 Next | st.radio in sidebar: Read Only / Project Manager / Document Controller |
-| Source System Health page | 🔲 After role | Reads staged_dq_flags.csv, shows DC remediation queue |
+| Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller |
+| Source System Health page | ✅ Complete | Per-source RAG tiles, DC remediation queue, mark-resolved with audit log |
 
 ## Next session — start here
 
-**Step 1: Role selector in `dashboard/app.py`**
+**Remaining stub pages:**
+- My Watchlist — show bookmarked docs with notes, remove bookmark button
+- Document Detail — show full record + STAGED lifecycle timeline from staged_events.csv
 
-Add a `st.radio` to the sidebar with three options:
-- Read Only (default)
-- Project Manager — can edit priority, critical path, percent complete, notes
-- Document Controller — can resolve DQ flags in remediation queue
+**Planned: Transformation log (next pipeline feature)**
 
-Store the active role in `st.session_state["active_role"]`.
+Currently `generate_staged_layer.py` makes two kinds of changes:
+- HIGH confidence (silent): date normalisation, clean discipline mapping, ID assignment — these happen with no audit trail
+- LOW confidence / broken data: DQ flags (already written to staged_dq_flags.csv)
 
-Gate the existing editable fields in MDR Register behind `active_role == "Project Manager"`.
+The gap: silent transformations leave no footprint. To close this, add a `staged_transformation_log.csv`
+output to `generate_staged_layer.py`. One row per field changed, columns:
+  source_system | source_native_id | mdr_id | field_name | original_value | normalised_value | normalisation_rule | confidence
 
-**Step 2: Source System Health page**
+Then add a "Pipeline Run Report" tab to the Source System Health page that reads this file and
+shows the full transformation history. DQ flags = human action required. Transformation log = FYI only.
+This demonstrates the difference between *automated* and *auditable* — strong interview talking point.
 
-Reads `data_generation/staged_dq_flags.csv`.
-Shows:
-- Per-source-system summary table (record count, DQ flag count, RAG status)
-- Drilldown table of unresolved flags filtered by `resolved == False`
-- DC-only edit: a "Mark resolved" button that sets `resolved=True`, `resolved_by`, `resolved_at`
-  and appends a `DQ_REMEDIATION` event to `staged_events.csv`
-
-Only visible / editable when `active_role == "Document Controller"`.
+**Architecture note — DQ_REMEDIATION audit trail:**
+When a DC marks a flag resolved, the event is written to `dashboard/edit_log.csv`
+(the dashboard audit trail), NOT to `staged_events.csv`. The staged_events.csv is the
+pipeline's document lifecycle event log (status transitions generated at pipeline run time)
+and must not be mixed with dashboard user actions. The log_edit() function handles
+both PM_UPDATE and DQ_REMEDIATION records — distinguished by the `field` column value
+(e.g. `dq_flag_resolved:DQF-0001`).
 
 ## Important field added in v2
 
