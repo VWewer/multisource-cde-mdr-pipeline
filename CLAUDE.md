@@ -188,8 +188,8 @@ Per source system, the page shows:
 |---|---|---|
 | Overview | ✅ Complete | RAG tiles, trend summary, critical path table, gatekeeper heatmap, discipline summary |
 | MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views |
-| My Watchlist | 🔲 Stub | Shows bookmarks df only — full build pending |
-| Document Detail | 🔲 Stub | Shows JSON row only — STAGED timeline pending |
+| My Watchlist | ✅ Complete | Per-doc cards: title, RAG badge, discipline/priority/status/%, editable note, Remove button |
+| Document Detail | ✅ Complete | Structured metadata sections + STAGED lifecycle timeline from staged_events.csv |
 | Source System Health | ✅ Complete | Per-source RAG tiles, unresolved flag drilldown, DC mark-resolved with audit log |
 
 ## Pipeline build status (v2)
@@ -230,8 +230,8 @@ in place of raw string literals:
 ## Next session — start here
 
 **Remaining stub pages:**
-- My Watchlist — show bookmarked docs with notes, remove bookmark button
-- Document Detail — show full record + STAGED lifecycle timeline from staged_events.csv
+- My Watchlist — DONE (Day 7). Cards with title, RAG badge, discipline/priority/status/%, editable note, Remove button.
+- Document Detail — DONE (Day 7). Structured metadata sections + STAGED lifecycle timeline joined via fulfilled_by_document_id -> document_id.
 
 **Planned: Transformation log (next pipeline feature)**
 

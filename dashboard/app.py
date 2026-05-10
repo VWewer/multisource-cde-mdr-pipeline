@@ -36,7 +36,8 @@ MDR_CSV        = DATA_DIR / "mdr_requirements.csv"
 EDIT_LOG_CSV   = DASHBOARD_DIR / "edit_log.csv"
 BOOKMARKS_CSV  = DASHBOARD_DIR / "bookmarks.csv"
 SAVED_VIEWS_JSON = DASHBOARD_DIR / "saved_views.json"
-DQ_FLAGS_CSV     = DATA_DIR / "staged_dq_flags.csv"
+DQ_FLAGS_CSV         = DATA_DIR / "staged_dq_flags.csv"
+STAGED_EVENTS_CSV    = DATA_DIR / "staged_events.csv"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -1292,24 +1293,364 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
 
 
 def page_watchlist(df: pd.DataFrame, current_user: str):
+    """My Watchlist page.
+
+    Shows documents the current user has bookmarked, enriched with live MDR
+    data (title, discipline, RAG status, priority, canonical status, % complete).
+    Users can edit their personal note in-place and remove bookmarks without
+    going back to the MDR Register.
+
+    Args:
+        df:           Full MDR DataFrame — joined with bookmarks for document details.
+        current_user: Currently active mock user (filters bookmarks and saves changes).
+    """
     st.markdown('<div class="page-title">My Watchlist</div>', unsafe_allow_html=True)
+
+    # ── Load this user's bookmarks ────────────────────────────────────────────
+    _log("LOAD", f"Loading bookmarks for {current_user}")
     bookmarks = load_bookmarks()
-    user_bm = bookmarks[bookmarks["username"] == current_user]
+    user_bm   = bookmarks[bookmarks["username"] == current_user].copy()
+
     if user_bm.empty:
-        st.info("No bookmarks yet. Use the MDR Register to add documents to your watchlist.")
-    else:
-        st.markdown(f"**{len(user_bm)} bookmarked documents**")
-        st.dataframe(user_bm, use_container_width=True)
-    st.info("🚧 Full watchlist view — to be built Day 4.")
+        st.info(
+            "No bookmarks yet. Open the MDR Register and tick the star column "
+            "on any document to add it here."
+        )
+        return
+
+    # ── Join with MDR to enrich each bookmark row ─────────────────────────────
+    # Only pull in the fields needed for the card — we don't want to duplicate
+    # the full register. Inner join: if an mdr_id no longer exists in the MDR
+    # the bookmark is silently skipped (orphan guard).
+    mdr_cols = [
+        "mdr_id", "document_title", "discipline", "rag_status",
+        "priority", "current_canonical_status", "reported_percent_complete",
+    ]
+    merged = user_bm.merge(df[mdr_cols], on="mdr_id", how="inner")
+
+    n = len(merged)
+    st.markdown(f"**{n} bookmarked document{'s' if n != 1 else ''}**")
+    st.markdown("---")
+
+    # ── One card per bookmark ──────────────────────────────────────────────────
+    for _, row in merged.iterrows():
+        with st.container():
+
+            # Header: document title on the left, RAG badge on the right
+            col_title, col_rag = st.columns([6, 1])
+            with col_title:
+                # mdr_id shown in small monospace beside the title
+                st.markdown(
+                    f"**{row['document_title']}**"
+                    f"&nbsp;&nbsp;"
+                    f"<span style='font-family:\"IBM Plex Mono\",monospace;"
+                    f" font-size:0.72rem; color:#7a8499;'>{row['mdr_id']}</span>",
+                    unsafe_allow_html=True,
+                )
+            with col_rag:
+                st.markdown(rag_badge(row["rag_status"]), unsafe_allow_html=True)
+
+            # Detail row: four label-value pairs
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.caption("Discipline")
+                st.markdown(f"**{row['discipline']}**")
+            with c2:
+                st.caption("Priority")
+                st.markdown(f"**{row['priority']}**")
+            with c3:
+                st.caption("Status")
+                # Convert SNAKE_CASE status to "Title Case" for readability
+                display_status = str(row["current_canonical_status"]).replace("_", " ").title()
+                st.markdown(f"**{display_status}**")
+            with c4:
+                st.caption("% Complete")
+                st.markdown(f"**{int(row['reported_percent_complete'])}%**")
+
+            st.markdown("")  # small vertical gap before the note field
+
+            # Personal note — editable text area
+            current_note = str(row["personal_note"]) if pd.notna(row["personal_note"]) else ""
+            new_note = st.text_area(
+                "Personal note",
+                value=current_note,
+                key=f"note_{row['mdr_id']}",
+                height=68,
+                placeholder="Add a personal note...",
+                label_visibility="collapsed",
+            )
+
+            # Action buttons: Save note (left) and Remove (right)
+            btn_save_col, btn_remove_col, _ = st.columns([1.2, 1.2, 5])
+
+            with btn_save_col:
+                if st.button("Save note", key=f"save_{row['mdr_id']}", type="primary"):
+                    # Only write to disk if the note actually changed
+                    if new_note != current_note:
+                        all_bm = load_bookmarks()
+                        mask = (
+                            (all_bm["username"] == current_user) &
+                            (all_bm["mdr_id"]   == row["mdr_id"])
+                        )
+                        all_bm.loc[mask, "personal_note"] = new_note
+                        try:
+                            all_bm.to_csv(BOOKMARKS_CSV, index=False)
+                            _log("BOOKMARK", f"{current_user} updated note on {row['mdr_id']}")
+                            st.toast("Note saved.")
+                        except Exception as e:
+                            _log("ERROR", f"Failed to save note: {e}")
+                            st.error(f"Could not save note: {e}")
+                    else:
+                        st.toast("No change to save.")
+
+            with btn_remove_col:
+                if st.button("Remove", key=f"remove_{row['mdr_id']}", type="secondary"):
+                    all_bm = load_bookmarks()
+                    # Drop this user's bookmark for this document
+                    all_bm = all_bm[
+                        ~((all_bm["username"] == current_user) & (all_bm["mdr_id"] == row["mdr_id"]))
+                    ]
+                    try:
+                        all_bm.to_csv(BOOKMARKS_CSV, index=False)
+                        _log("BOOKMARK", f"{current_user} removed {row['mdr_id']} from watchlist")
+                    except Exception as e:
+                        _log("ERROR", f"Failed to remove bookmark: {e}")
+                        st.error(f"Could not remove bookmark: {e}")
+                    # Rerun so the card disappears immediately
+                    st.rerun()
+
+            st.markdown("---")
 
 
 def page_document_detail(df: pd.DataFrame, current_user: str):
+    """Document Detail page.
+
+    Shows a structured view of a single MDR document: key metadata fields
+    grouped by category (Classification, Schedule, Status, Key Dates,
+    Responsibility), followed by the full STAGED lifecycle timeline —
+    all status transitions recorded at pipeline ingestion time for that document.
+
+    Args:
+        df:           Full MDR DataFrame — source for document metadata.
+        current_user: Currently active mock user (unused here, reserved for future edits).
+    """
     st.markdown('<div class="page-title">Document Detail</div>', unsafe_allow_html=True)
-    mdr_ids = df["mdr_id"].tolist()
-    selected = st.selectbox("Select document", mdr_ids)
+
+    # ── Document selector ─────────────────────────────────────────────────────
+    # Build a title lookup so the dropdown shows a readable label, not just an ID.
+    title_map = dict(zip(df["mdr_id"], df["document_title"]))
+    mdr_ids   = df["mdr_id"].tolist()
+    selected  = st.selectbox(
+        "Select document",
+        options=mdr_ids,
+        format_func=lambda mid: f"{title_map.get(mid, mid)}  ({mid})",
+        key="detail_doc_select",
+    )
+
     row = df[df["mdr_id"] == selected].iloc[0]
-    st.json(row.to_dict())
-    st.info("🚧 Full detail view with STAGED timeline — to be built Day 4.")
+    _log("LOAD", f"Document detail view for {selected}")
+
+    st.markdown("---")
+
+    # ── Document header ───────────────────────────────────────────────────────
+    col_title, col_rag = st.columns([6, 1])
+    with col_title:
+        st.markdown(f"### {row['document_title']}")
+        st.markdown(
+            f"<span style='font-family:\"IBM Plex Mono\",monospace; font-size:0.8rem;"
+            f" color:#7a8499;'>{row['mdr_id']}</span>",
+            unsafe_allow_html=True,
+        )
+    with col_rag:
+        st.markdown(rag_badge(row["rag_status"]), unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Classification ────────────────────────────────────────────────────────
+    st.markdown("**Classification**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.caption("Discipline")
+        st.markdown(f"**{row['discipline']}**")
+    with c2:
+        st.caption("Document Type")
+        st.markdown(f"**{row['document_type']}**")
+    with c3:
+        st.caption("File Format")
+        st.markdown(f"**{row['file_format']}**")
+    with c4:
+        st.caption("Approval Class")
+        st.markdown(f"**{row['approval_class']}**")
+
+    st.markdown("")
+
+    # ── Schedule ──────────────────────────────────────────────────────────────
+    st.markdown("**Schedule**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.caption("Priority")
+        st.markdown(f"**{row['priority']}**")
+    with c2:
+        st.caption("Critical Path")
+        # is_on_critical_path may arrive as bool or the strings "True"/"False"
+        cp_raw = row["is_on_critical_path"]
+        cp_str = "Yes" if str(cp_raw).lower() in ("true", "1", "yes") else "No"
+        st.markdown(f"**{cp_str}**")
+    with c3:
+        st.caption("% Complete")
+        st.markdown(f"**{int(row['reported_percent_complete'])}%**")
+    with c4:
+        st.caption("Schedule Float")
+        fv = row.get("schedule_float_days")
+        float_str = f"{int(fv)} days" if pd.notna(fv) else "—"
+        st.markdown(f"**{float_str}**")
+
+    st.markdown("")
+
+    # ── Status & revision ─────────────────────────────────────────────────────
+    st.markdown("**Status**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.caption("Current Status")
+        display_status = str(row["current_canonical_status"]).replace("_", " ").title()
+        st.markdown(f"**{display_status}**")
+    with c2:
+        st.caption("Revision")
+        st.markdown(f"**{row['current_revision']}**")
+    with c3:
+        st.caption("Confidentiality")
+        st.markdown(f"**{row['confidentiality_class']}**")
+    with c4:
+        st.caption("Source System")
+        st.markdown(f"**{row['source_system']}**")
+
+    st.markdown("")
+
+    # ── Key dates ─────────────────────────────────────────────────────────────
+    st.markdown("**Key Dates**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.caption("Planned Submission")
+        st.markdown(f"**{row['planned_submission_date']}**")
+    with c2:
+        st.caption("Planned Approval")
+        st.markdown(f"**{row['planned_approval_date']}**")
+    with c3:
+        st.caption("Baseline Approval")
+        bv = row.get("baseline_approval_date")
+        st.markdown(f"**{bv if pd.notna(bv) else '—'}**")
+    with c4:
+        st.caption("Last Status Change")
+        # last_status_change is a full ISO timestamp — trim to date for readability
+        lsc = str(row.get("last_status_change", ""))
+        st.markdown(f"**{lsc[:10] if len(lsc) >= 10 else '—'}**")
+
+    st.markdown("")
+
+    # ── Responsibility ────────────────────────────────────────────────────────
+    st.markdown("**Responsibility**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.caption("Responsible Person")
+        st.markdown(f"**{row['responsible_person']}**")
+    with c2:
+        st.caption("Responsible Company")
+        st.markdown(f"**{row['responsible_company']}**")
+    with c3:
+        st.caption("Certifying Body")
+        cb = row.get("certifying_body")
+        st.markdown(f"**{cb if pd.notna(cb) and str(cb).strip() else '—'}**")
+
+    # ── Notes (only shown if present) ────────────────────────────────────────
+    notes_val = row.get("notes")
+    if pd.notna(notes_val) and str(notes_val).strip():
+        st.markdown("")
+        st.markdown("**Notes**")
+        st.info(str(notes_val))
+
+    # ── STAGED lifecycle timeline ─────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### STAGED Lifecycle Timeline")
+    st.caption(
+        "Status transitions recorded at pipeline ingestion time from the source system. "
+        "Each row is one state change for this document."
+    )
+
+    if not STAGED_EVENTS_CSV.exists():
+        _log("ERROR", f"staged_events.csv not found at {STAGED_EVENTS_CSV}")
+        st.error(
+            "staged_events.csv not found. "
+            "Run data_generation/generate_staged_layer.py first."
+        )
+        return
+
+    _log("LOAD", f"Reading staged events from {STAGED_EVENTS_CSV}")
+    events_all = pd.read_csv(STAGED_EVENTS_CSV)
+
+    # Join key: mdr row's fulfilled_by_document_id matches staged_events' document_id
+    doc_uuid = row["fulfilled_by_document_id"]
+    events = events_all[events_all["document_id"] == doc_uuid].copy()
+
+    if events.empty:
+        st.warning(f"No STAGED events found for document_id {doc_uuid}.")
+        return
+
+    # Sort chronologically so the timeline reads top-to-bottom in time order
+    events = events.sort_values("planned_timestamp").reset_index(drop=True)
+
+    # ── Helper formatters for the display table ───────────────────────────────
+    def fmt_ts(val):
+        """Trim ISO timestamp to date portion only (2025-10-03T... -> 2025-10-03)."""
+        s = str(val)
+        return s[:10] if len(s) >= 10 and s != "nan" else "—"
+
+    def fmt_status(val):
+        """SNAKE_CASE_STATUS -> Title Case Status for human readability."""
+        return str(val).replace("_", " ").title() if pd.notna(val) else "—"
+
+    def fmt_num(val):
+        """Numeric field to int string, or — if missing."""
+        try:
+            return str(int(val)) if pd.notna(val) else "—"
+        except (ValueError, TypeError):
+            return "—"
+
+    # Build a clean display-only DataFrame — raw UUIDs and internal IDs are hidden
+    timeline = pd.DataFrame({
+        "#":              range(1, len(events) + 1),
+        "From Status":    events["from_status"].map(fmt_status),
+        "To Status":      events["to_status"].map(fmt_status),
+        "Planned":        events["planned_timestamp"].map(fmt_ts),
+        "Actual":         events["actual_timestamp"].map(fmt_ts),
+        "Variance (d)":   events["variance_days"].map(fmt_num),
+        "Rev":            events["target_revision"],
+        "Approval Class": events["approval_class"],
+        "Entered By":     events["entered_by"].fillna("—"),
+        "Comments":       events["comments"].fillna(""),
+    })
+
+    st.dataframe(
+        timeline,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "#":              st.column_config.NumberColumn("#", width="small"),
+            "From Status":    st.column_config.TextColumn("From Status",    width="medium"),
+            "To Status":      st.column_config.TextColumn("To Status",      width="medium"),
+            "Planned":        st.column_config.TextColumn("Planned",        width="small"),
+            "Actual":         st.column_config.TextColumn("Actual",         width="small"),
+            "Variance (d)":   st.column_config.TextColumn("Var (d)",        width="small"),
+            "Rev":            st.column_config.TextColumn("Rev",            width="small"),
+            "Approval Class": st.column_config.TextColumn("Approval",       width="small"),
+            "Entered By":     st.column_config.TextColumn("Entered By",     width="medium"),
+            "Comments":       st.column_config.TextColumn("Comments",       width="large"),
+        },
+    )
+
+    st.caption(
+        f"{len(events)} events  |  source: staged_events.csv  |  "
+        f"document_id: {doc_uuid}"
+    )
 
 
 def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
