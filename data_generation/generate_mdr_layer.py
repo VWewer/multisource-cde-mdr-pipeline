@@ -323,7 +323,10 @@ def main():
         canonical_status = doc["canonical_status"]
         document_id      = doc["document_id"]
 
-        mdr_id   = next_mdr_id(discipline)
+        # Use the canonical ISO 19650 ID already assigned by the STAGED layer
+        # (e.g. PROJ1-ALPHAENG-ZZ-SH-IN-000001). Do NOT generate a new one here —
+        # the ID must be stable and consistent across all pipeline outputs.
+        mdr_id   = doc["mdr_id"]
         priority = assign_priority(approval_class)
 
         planned_submission_date, planned_approval_date = generate_planned_dates(

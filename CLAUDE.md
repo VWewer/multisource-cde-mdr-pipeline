@@ -186,11 +186,11 @@ Per source system, the page shows:
 
 | Page | Status | Notes |
 |---|---|---|
-| Overview | ✅ Complete | RAG tiles, trend summary, critical path table, gatekeeper heatmap, discipline summary |
-| MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views |
-| My Watchlist | ✅ Complete | Per-doc cards: title, RAG badge, discipline/priority/status/%, editable note, Remove button |
-| Document Detail | ✅ Complete | Structured metadata sections + STAGED lifecycle timeline from staged_events.csv |
-| Source System Health | ✅ Complete | Per-source RAG tiles, unresolved flag drilldown, DC mark-resolved with audit log |
+| Overview | ✅ Complete | RAG tiles + filter buttons, trend tiles + filter buttons, RAG/trend legends, how-to guide expander, pipeline flags summary, My Watchlist quick-access strip, gatekeeper heatmap (PM/DC only) |
+| MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views, `-> Detail` navigate trigger, `Src Doc` demo dialog trigger |
+| My Watchlist | ✅ Complete | Per-doc cards with "View Detail ->" button (same-tab navigation via staging keys) |
+| Document Detail | ✅ Complete | Structured metadata sections + STAGED lifecycle timeline; pre-selectable via session_state |
+| Source System Health | ✅ Complete | Per-source RAG tiles, DC remediation queue, mark-resolved with audit log |
 
 ## Pipeline build status (v2)
 
@@ -199,9 +199,9 @@ Per source system, the page shows:
 | `generate_windchill_source.py` | ✅ Complete | 30 rows, source-native schema, 5 DQ issues injected |
 | `generate_sharepoint_source.py` | ✅ Complete | 20 rows, source-native schema, 4 DQ issues injected |
 | `generate_aveva_source.py` | ✅ Complete | 10 rows, source-native schema, 1 DQ issue injected |
-| `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files |
-| `generate_mdr_layer.py` | ✅ Unchanged | Still works — reads new raw_documents.csv without modification |
-| Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller |
+| `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files. Document titles are now clean (`document_type` only — no discipline prefix or source native ID suffix) |
+| `generate_mdr_layer.py` | ✅ Updated | Now uses `doc["mdr_id"]` (proper ISO 19650 ID from STAGED) instead of generating its own `MDR-INS-001` style IDs |
+| Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller. Switching user auto-sets role and pre-filters MDR Register discipline |
 | Source System Health page | ✅ Complete | Per-source RAG tiles, DC remediation queue, mark-resolved with audit log |
 
 ## Code architecture — key module-level constants (app.py)
@@ -226,26 +226,42 @@ in place of raw string literals:
 | `save_dq_flags(dq)` | Thin wrapper — calls `save_csv` with no date columns |
 | `log_edit(user, mdr_id, field, old, new)` | Audit trail append — used for both PM_UPDATE and DQ_REMEDIATION events |
 | `_log(label, msg)` | Terminal lifecycle log — every key event must call this |
+| `fmt_date(val)` | Strips `00:00:00` from pandas Timestamps — use everywhere a date is displayed in the UI |
+| `_source_doc_dialog(mdr_id, title)` | `@st.dialog` modal shown when "Src Doc" trigger column is checked in MDR Register |
+
+**Navigation staging pattern (important):**
+Streamlit raises `StreamlitAPIException` if you set a widget's session_state key after that widget has rendered.
+The sidebar nav radio (`key="nav_page"`) and document detail selectbox (`key="detail_doc_select"`) are rendered
+early. To navigate from any page, write to the staging keys instead:
+```python
+st.session_state["_nav_request"]    = "Document Detail"   # page name
+st.session_state["_detail_request"] = mdr_id              # document to pre-select
+st.rerun()
+```
+`render_sidebar()` pops these keys at the top (before widgets render) and applies them correctly.
 
 ## Next session — start here
 
-**Remaining stub pages:**
-- My Watchlist — DONE (Day 7). Cards with title, RAG badge, discipline/priority/status/%, editable note, Remove button.
-- Document Detail — DONE (Day 7). Structured metadata sections + STAGED lifecycle timeline joined via fulfilled_by_document_id -> document_id.
+**Dashboard UX is feature-complete (Day 8). All pages work, all roles gate correctly.**
 
-**Planned: Transformation log (next pipeline feature)**
+**Candidate next features (pick one):**
 
-Currently `generate_staged_layer.py` makes two kinds of changes:
-- HIGH confidence (silent): date normalisation, clean discipline mapping, ID assignment — these happen with no audit trail
-- LOW confidence / broken data: DQ flags (already written to staged_dq_flags.csv)
+1. **Transformation log (pipeline feature — strong interview talking point)**
+   `generate_staged_layer.py` makes two kinds of changes:
+   - HIGH confidence (silent): date normalisation, discipline mapping, ID assignment — no audit trail
+   - LOW confidence: DQ flags (already written to `staged_dq_flags.csv`)
+   The gap: silent transformations leave no footprint. Add `staged_transformation_log.csv` to `generate_staged_layer.py`:
+   `source_system | source_native_id | mdr_id | field_name | original_value | normalised_value | normalisation_rule | confidence`
+   Then add a "Pipeline Run Report" tab to Source System Health that reads this file.
+   DQ flags = human action required. Transformation log = FYI only. Demonstrates the distinction between *automated* and *auditable*.
 
-The gap: silent transformations leave no footprint. To close this, add a `staged_transformation_log.csv`
-output to `generate_staged_layer.py`. One row per field changed, columns:
-  source_system | source_native_id | mdr_id | field_name | original_value | normalised_value | normalisation_rule | confidence
+2. **Video / demo script**
+   Record the recruiter-facing video. Script: 60-second pitch → live dashboard walkthrough.
+   Recommended order: Overview (RAG tiles) → MDR Register (filter to RED, open detail) → Source System Health (resolve a DQ flag).
 
-Then add a "Pipeline Run Report" tab to the Source System Health page that reads this file and
-shows the full transformation history. DQ flags = human action required. Transformation log = FYI only.
-This demonstrates the difference between *automated* and *auditable* — strong interview talking point.
+3. **Snowflake sync**
+   Run `load_to_snowflake.py` to push regenerated CSVs (titles and IDs changed this session).
+   Then verify dashboard reads from Snowflake correctly for STAGED data.
 
 **Architecture note — DQ_REMEDIATION audit trail:**
 When a DC marks a flag resolved, the event is written to `dashboard/edit_log.csv`
@@ -255,11 +271,11 @@ and must not be mixed with dashboard user actions. The log_edit() function handl
 both PM_UPDATE and DQ_REMEDIATION records — distinguished by the `field` column value
 (e.g. `dq_flag_resolved:DQF-0001`).
 
-## Important field added in v2
+## Important fields in v2
 
-`raw_documents.csv` now contains a `mdr_id` field (canonical ISO 19650 ID).
-`generate_mdr_layer.py` ignores it (reads only named fields it needs).
-The dashboard can use `mdr_id` as the stable display identifier for documents.
+`raw_documents.csv` contains `mdr_id` (canonical ISO 19650 ID, e.g. `PROJ1-ALPHAENG-ZZ-SH-IN-000001`).
+`generate_mdr_layer.py` now reads and uses this field directly — it no longer generates its own IDs.
+Document `title` in `raw_documents.csv` is now just `document_type` (e.g. `"Instrument Index"`) — no discipline prefix, no source native ID suffix.
 
 ---
 
