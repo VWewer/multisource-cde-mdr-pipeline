@@ -186,11 +186,11 @@ Per source system, the page shows:
 
 | Page | Status | Notes |
 |---|---|---|
-| Overview | ✅ Complete | RAG tiles + filter buttons, trend tiles + filter buttons, RAG/trend legends, how-to guide expander, pipeline flags summary, My Watchlist quick-access strip, gatekeeper heatmap (PM/DC only) |
-| MDR Register | ✅ Complete | Filters, column selector, sort, editable table, bookmark toggle, Excel export, saved views, `-> Detail` navigate trigger, `Src Doc` demo dialog trigger |
+| Overview | ✅ Complete | RAG tiles + nav buttons (reset all filters before setting one), trend tiles + nav buttons, RAG/trend legends, how-to guide expander, pipeline flags summary, My Watchlist strip, gatekeeper heatmap (PM/DC only). Critical Path panel: per-row Detail buttons (no st.dataframe selection checkbox). |
+| MDR | ✅ Complete | Renamed from "MDR Register" (MDR = Master Document Register — "Register" was redundant). Filters: discipline/RAG/priority/critical path/approval/trend/person dropdowns + free-text search (partial match on ID, title, person, discipline). Column selector, sort, editable table, bookmark toggle, Excel export, saved views. Trigger columns `->` (Detail) and `Src` (source doc dialog) as CheckboxColumn — Streamlit's only per-row trigger mechanism. Document Actions selectbox below table as alternative. |
 | My Watchlist | ✅ Complete | Per-doc cards with "View Detail ->" button (same-tab navigation via staging keys) |
 | Document Detail | ✅ Complete | Structured metadata sections + STAGED lifecycle timeline; pre-selectable via session_state |
-| Source System Health | ✅ Complete | Per-source RAG tiles, DC remediation queue, mark-resolved with audit log |
+| Source System Health | ✅ Complete | Per-source RAG tiles, DC remediation queue (per-flag expander cards with value input + Confirm Resolved). Three tabs: DC Remediation Queue / Pipeline Run Report / Resolution Audit Trail. Resolution Audit Trail reads edit_log.csv and shows all DQ_REMEDIATION events. |
 
 ## Pipeline build status (v2)
 
@@ -199,10 +199,10 @@ Per source system, the page shows:
 | `generate_windchill_source.py` | ✅ Complete | 30 rows, source-native schema, 5 DQ issues injected |
 | `generate_sharepoint_source.py` | ✅ Complete | 20 rows, source-native schema, 4 DQ issues injected |
 | `generate_aveva_source.py` | ✅ Complete | 10 rows, source-native schema, 1 DQ issue injected |
-| `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files. Document titles are now clean (`document_type` only — no discipline prefix or source native ID suffix) |
-| `generate_mdr_layer.py` | ✅ Updated | Now uses `doc["mdr_id"]` (proper ISO 19650 ID from STAGED) instead of generating its own `MDR-INS-001` style IDs |
-| Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller. Switching user auto-sets role and pre-filters MDR Register discipline |
-| Source System Health page | ✅ Complete | Per-source RAG tiles, DC remediation queue, mark-resolved with audit log |
+| `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files + `staged_transformation_log.csv` |
+| `generate_mdr_layer.py` | ✅ Complete | Option B RAG thresholds: separate Critical Path tier (AMBER ≤ 14d, RED ≤ 3d). Uses ISO 19650 IDs from STAGED. |
+| Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller. Switching user auto-sets role and pre-filters MDR discipline. |
+| Source System Health page | ✅ Complete | 3 tabs: DC Remediation Queue, Pipeline Run Report (transformation log), Resolution Audit Trail (edit_log.csv) |
 
 ## Code architecture — key module-level constants (app.py)
 
@@ -227,49 +227,71 @@ in place of raw string literals:
 | `log_edit(user, mdr_id, field, old, new)` | Audit trail append — used for both PM_UPDATE and DQ_REMEDIATION events |
 | `_log(label, msg)` | Terminal lifecycle log — every key event must call this |
 | `fmt_date(val)` | Strips `00:00:00` from pandas Timestamps — use everywhere a date is displayed in the UI |
-| `_source_doc_dialog(mdr_id, title)` | `@st.dialog` modal shown when "Src Doc" trigger column is checked in MDR Register |
+| `_source_doc_dialog(mdr_id, title)` | `@st.dialog` modal shown when "Src" trigger column is checked in the MDR page |
 
 **Navigation staging pattern (important):**
 Streamlit raises `StreamlitAPIException` if you set a widget's session_state key after that widget has rendered.
-The sidebar nav radio (`key="nav_page"`) and document detail selectbox (`key="detail_doc_select"`) are rendered
-early. To navigate from any page, write to the staging keys instead:
+The sidebar nav radio (`key="nav_page"`) is rendered early. To navigate from any page, write to staging keys
+that `render_sidebar()` applies at the very top of its next run, before any widget is instantiated:
+
 ```python
+# Forward navigation — pushes current page onto _nav_history (Back button can return here)
 st.session_state["_nav_request"]    = "Document Detail"   # page name
-st.session_state["_detail_request"] = mdr_id              # document to pre-select
+st.session_state["_detail_request"] = mdr_id              # document to pre-select (optional)
+st.rerun()
+
+# Back navigation — pops _nav_history, does NOT push to history
+st.session_state["_back_request"] = prev["page"]
 st.rerun()
 ```
-`render_sidebar()` pops these keys at the top (before widgets render) and applies them correctly.
+
+`render_sidebar()` checks `_back_request` first (no history push), then `_nav_request` (pushes current page),
+then `_detail_request`. The Back button writes to `_back_request` so it never causes a `StreamlitAPIException`.
+Setting `nav_page` directly inside `render_sidebar()` after the radio renders will always raise the exception —
+use the staging keys.
 
 ## Next session — start here
 
-**Dashboard UX is feature-complete (Day 8). All pages work, all roles gate correctly.**
+**Project is demo-ready as of Day 10. Do not add features — prepare to present.**
 
-**Candidate next features (pick one):**
+### Pre-interview checklist (do this before any interview)
 
-1. **Transformation log (pipeline feature — strong interview talking point)**
-   `generate_staged_layer.py` makes two kinds of changes:
-   - HIGH confidence (silent): date normalisation, discipline mapping, ID assignment — no audit trail
-   - LOW confidence: DQ flags (already written to `staged_dq_flags.csv`)
-   The gap: silent transformations leave no footprint. Add `staged_transformation_log.csv` to `generate_staged_layer.py`:
-   `source_system | source_native_id | mdr_id | field_name | original_value | normalised_value | normalisation_rule | confidence`
-   Then add a "Pipeline Run Report" tab to Source System Health that reads this file.
-   DQ flags = human action required. Transformation log = FYI only. Demonstrates the distinction between *automated* and *auditable*.
+1. **Sync Snowflake** — CSV data was regenerated (IDs and titles changed). Snowflake is stale.
+   ```powershell
+   cd data_generation
+   python load_to_snowflake.py
+   ```
+   Verify the dashboard reads STAGED data from Snowflake correctly after the sync.
 
-2. **Video / demo script**
-   Record the recruiter-facing video. Script: 60-second pitch → live dashboard walkthrough.
-   Recommended order: Overview (RAG tiles) → MDR Register (filter to RED, open detail) → Source System Health (resolve a DQ flag).
+2. **Dress rehearsal** — run through the demo path end to end, in order:
+   - Overview → explain the business problem (RAG tiles, Critical Path panel)
+   - MDR → filter to RED, search by name, open Document Detail via `->` column
+   - Source System Health → resolve a DQ flag, show it in the Resolution Audit Trail tab
+   - (Optional for technical audience) show `generate_staged_layer.py` in the IDE
 
-3. **Snowflake sync**
-   Run `load_to_snowflake.py` to push regenerated CSVs (titles and IDs changed this session).
-   Then verify dashboard reads from Snowflake correctly for STAGED data.
+3. **Record the video** — 60-second pitch + dashboard walkthrough.
+   Pitch script is in the "60-second pitch" section above.
 
-**Architecture note — DQ_REMEDIATION audit trail:**
+### On Snowflake Streamlit hosting
+
+Do not migrate before interviews. The effort is 2–3 days — all CSV reads need SQL,
+all file writes (edit_log.csv, bookmarks.csv, saved_views.json) need Snowflake tables,
+and the runtime environment is more restrictive than local.
+
+The Snowflake *connection* is already in the app and reads from STAGED/ANALYTICAL —
+that is sufficient to demonstrate Snowflake integration. In conversation:
+> "In production this would be hosted in Streamlit in Snowflake — the connection is
+> already wired, the migration is straightforward but out of scope for the demo."
+
+### Architecture note — DQ_REMEDIATION audit trail
+
 When a DC marks a flag resolved, the event is written to `dashboard/edit_log.csv`
 (the dashboard audit trail), NOT to `staged_events.csv`. The staged_events.csv is the
 pipeline's document lifecycle event log (status transitions generated at pipeline run time)
 and must not be mixed with dashboard user actions. The log_edit() function handles
 both PM_UPDATE and DQ_REMEDIATION records — distinguished by the `field` column value
-(e.g. `dq_flag_resolved:DQF-0001`).
+(e.g. `dq_flag_resolved:DQF-0001`). The Resolution Audit Trail tab in Source System Health
+reads edit_log.csv and surfaces these events in the UI.
 
 ## Important fields in v2
 

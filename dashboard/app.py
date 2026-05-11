@@ -140,13 +140,14 @@ html, body, [class*="css"] {
 #MainMenu, footer, header { visibility: hidden; }
 .block-container { padding: 1.5rem 2rem 2rem 2rem !important; }
 
-/* ── Remove sidebar collapse button ── */
-/* Hides only the collapse arrow INSIDE the sidebar so users cannot close it
-   accidentally. The expand arrow in the main content area is left untouched —
-   the JS in main() auto-clicks it on load to recover from any localStorage
-   "collapsed" state, so manual cache clearing is no longer required. */
-button[data-testid="stSidebarCollapseButton"] {
+/* ── Remove sidebar collapse button (CSS attempt — JS below is the reliable path) ── */
+/* data-testid may vary by Streamlit version; the JS MutationObserver in main()
+   is the primary mechanism — this is belt-and-suspenders only. */
+button[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCollapseButton"] {
     display: none !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
 }
 
 /* ── App header bar ── */
@@ -864,8 +865,11 @@ def _source_doc_dialog(mdr_id: str, title: str):
         unsafe_allow_html=True,
     )
     st.markdown("")
+    # Returning from a @st.dialog function closes the dialog immediately.
+    # st.rerun() inside a dialog reruns the dialog itself, not the outer app,
+    # which is why it appeared unresponsive.
     if st.button("Close", type="primary", key="src_doc_close"):
-        st.rerun()
+        return
 
 
 def rag_badge(rag: str) -> str:
@@ -894,8 +898,13 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
     # BEFORE this function renders the nav radio widget.  We apply them here so that
     # Streamlit sees the new value before the widget is instantiated (setting a widget
     # key after the widget has rendered raises StreamlitAPIException).
-    if "_nav_request" in st.session_state:
-        # Push current page to history before navigating so "← Back" can return here.
+    # _back_request: written by the Back button — applies without pushing to history
+    # (if we used _nav_request it would push the destination back onto the stack).
+    if "_back_request" in st.session_state:
+        st.session_state["nav_page"] = st.session_state.pop("_back_request")
+    # _nav_request: written by link tiles / action buttons — pushes current page to
+    # history so the Back button can return here.
+    elif "_nav_request" in st.session_state:
         nav_history = st.session_state.setdefault("_nav_history", [])
         nav_history.append({
             "page":   st.session_state.get("nav_page", "Overview"),
@@ -986,7 +995,7 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
         st.markdown('<div class="sidebar-section">Navigation</div>', unsafe_allow_html=True)
         page = st.radio(
             "Page",
-            ["Overview", "MDR Register", "My Watchlist", "Document Detail", "Source System Health"],
+            ["Overview", "MDR", "My Watchlist", "Document Detail", "Source System Health"],
             label_visibility="collapsed",
             key="nav_page",
             help="Switch between dashboard pages.",
@@ -1006,9 +1015,13 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
         ):
             prev = nav_history.pop()
             st.session_state["_nav_history"] = nav_history
-            st.session_state["nav_page"]     = prev["page"]
-            if prev["detail"]:
-                st.session_state["detail_doc_select"] = prev["detail"]
+            # Use _back_request so render_sidebar applies it at the TOP of the next
+            # render pass, before the nav radio widget is instantiated.  Setting
+            # nav_page directly here raises StreamlitAPIException because the radio
+            # with key="nav_page" has already been rendered this pass.
+            st.session_state["_back_request"] = prev["page"]
+            if prev.get("detail"):
+                st.session_state["_detail_request"] = prev["detail"]
             st.rerun()
 
         st.divider()
@@ -1114,7 +1127,7 @@ Controls what you can edit in this session:
 | Page | Purpose |
 |---|---|
 | Overview | RAG summary, date trend, critical path at a glance |
-| MDR Register | Full document list — filter, sort, export, inline edits (PM role) |
+| MDR | Full document list — filter, sort, export, inline edits (PM role) |
 | My Watchlist | Bookmarked documents with personal notes — quick status check |
 | Document Detail | Single document deep-dive: metadata + full STAGED lifecycle timeline |
 | Source System Health | Per-source RAG, DQ flag queue, mark flags resolved (DC role) |
@@ -1186,7 +1199,7 @@ Controls what you can edit in this session:
         pre-filters (e.g. sarah.chen has reg_disc=Instrumentation) which would otherwise
         silently reduce '12 RED' to '2 RED' by intersecting with the user discipline filter.
         """
-        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person"):
+        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person", "reg_search"):
             st.session_state[k] = "All"
         if rag_val:
             st.session_state["reg_rag"]    = rag_val
@@ -1196,7 +1209,7 @@ Controls what you can edit in this session:
             st.session_state["reg_disc"]   = disc_val
         if person_val:
             st.session_state["reg_person"] = person_val
-        st.session_state["_nav_request"] = "MDR Register"
+        st.session_state["_nav_request"] = "MDR"
         st.rerun()
 
     btn_r, btn_a, btn_g, btn_t = st.columns(4)
@@ -1304,38 +1317,37 @@ Controls what you can edit in this session:
         if crit.empty:
             st.markdown('<p style="color:#4a5568; font-size:0.8rem;">No critical path items at RED or AMBER.</p>', unsafe_allow_html=True)
         else:
-            # Build a display table — trend icons added as a plain text column
-            TREND_ICON = {"SLIPPING": "📉 Slipping", "STALLED": "⏸ Stalled",
-                          "RECOVERING": "📈 Recovering", "STABLE": "Stable"}
-            crit_display = crit[[
-                "mdr_id", "document_title", "discipline", "rag_status",
-                "schedule_float_days", "date_trend", "responsible_person",
-            ]].copy()
-            crit_display["date_trend"] = crit_display["date_trend"].map(TREND_ICON).fillna("")
+            # Render as per-row columns with an explicit Detail button in each row.
+            # We avoid st.dataframe(on_select) because Streamlit adds an unavoidable
+            # selection-checkbox column which confused users.
+            TREND_LABEL = {"SLIPPING": "Slipping", "STALLED": "Stalled",
+                           "RECOVERING": "Recovering", "STABLE": "Stable"}
 
-            st.caption("Click a row to open Document Detail for that document.")
-            evt = st.dataframe(
-                crit_display,
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                column_config={
-                    "mdr_id":              st.column_config.TextColumn("ID",         width="small"),
-                    "document_title":      st.column_config.TextColumn("Document",   width="large"),
-                    "discipline":          st.column_config.TextColumn("Disc.",       width="small"),
-                    "rag_status":          st.column_config.TextColumn("RAG",         width="small"),
-                    "schedule_float_days": st.column_config.NumberColumn("Float (d)", format="%d"),
-                    "date_trend":          st.column_config.TextColumn("Trend",       width="medium"),
-                    "responsible_person":  st.column_config.TextColumn("Lead",        width="medium"),
-                },
-            )
-            # Row click triggers navigation to Document Detail
-            if evt.selection.rows:
-                selected_id = crit_display.iloc[evt.selection.rows[0]]["mdr_id"]
-                st.session_state["_nav_request"]    = "Document Detail"
-                st.session_state["_detail_request"] = selected_id
-                st.rerun()
+            # Column header row
+            h1, h2, h3, h4, h5, h6 = st.columns([1.6, 3.2, 1.1, 1.0, 1.8, 1.3])
+            h1.markdown('<span style="font-size:0.72rem;color:#7a8499;font-family:\'IBM Plex Mono\',monospace;">ID</span>', unsafe_allow_html=True)
+            h2.markdown('<span style="font-size:0.72rem;color:#7a8499;font-family:\'IBM Plex Mono\',monospace;">DOCUMENT</span>', unsafe_allow_html=True)
+            h3.markdown('<span style="font-size:0.72rem;color:#7a8499;font-family:\'IBM Plex Mono\',monospace;">DISC.</span>', unsafe_allow_html=True)
+            h4.markdown('<span style="font-size:0.72rem;color:#7a8499;font-family:\'IBM Plex Mono\',monospace;">RAG</span>', unsafe_allow_html=True)
+            h5.markdown('<span style="font-size:0.72rem;color:#7a8499;font-family:\'IBM Plex Mono\',monospace;">FLOAT / TREND</span>', unsafe_allow_html=True)
+            h6.markdown("")
+            st.markdown('<hr style="margin:0.2rem 0 0.4rem 0;border-color:#2a3040;">', unsafe_allow_html=True)
+
+            for _, row in crit.iterrows():
+                c1, c2, c3, c4, c5, c6 = st.columns([1.6, 3.2, 1.1, 1.0, 1.8, 1.3])
+                rag_color = RAG_COLOR_MAP.get(str(row["rag_status"]), "#7a8499")
+                trend_lbl = TREND_LABEL.get(str(row["date_trend"]), str(row["date_trend"]))
+                float_d   = int(row["schedule_float_days"]) if pd.notna(row.get("schedule_float_days")) else 0
+                c1.markdown(f'<span style="font-size:0.72rem;font-family:\'IBM Plex Mono\',monospace;color:#7a8499;">{row["mdr_id"]}</span>', unsafe_allow_html=True)
+                c2.markdown(f'<span style="font-size:0.82rem;">{row["document_title"]}</span>', unsafe_allow_html=True)
+                c3.markdown(f'<span style="font-size:0.78rem;color:#7a8499;">{row["discipline"]}</span>', unsafe_allow_html=True)
+                c4.markdown(f'<span style="color:{rag_color};font-weight:600;font-size:0.82rem;">● {row["rag_status"]}</span>', unsafe_allow_html=True)
+                c5.markdown(f'<span style="font-size:0.78rem;color:#7a8499;">{float_d}d &nbsp;·&nbsp; {trend_lbl}</span>', unsafe_allow_html=True)
+                with c6:
+                    if st.button("Detail ->", key=f"cp_det_{row['mdr_id']}", use_container_width=True):
+                        st.session_state["_nav_request"]    = "Document Detail"
+                        st.session_state["_detail_request"] = row["mdr_id"]
+                        st.rerun()
 
     with col_right:
         # Gatekeeper heatmap is restricted to PM and DC — it names individuals who
@@ -1531,7 +1543,7 @@ Controls what you can edit in this session:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | None, active_role: str = "Read Only"):  # noqa: C901
-    st.markdown('<div class="page-title">MDR Register</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-title">Master Document Register</div>', unsafe_allow_html=True)
 
     # Load saved view defaults
     views     = load_saved_views()
@@ -1543,7 +1555,7 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     # Reset filter widget state when the active view changes so new defaults apply
     if st.session_state.get("_reg_view") != active_view:
         st.session_state["_reg_view"] = active_view
-        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person", "reg_cols"):
+        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person", "reg_search", "reg_cols"):
             st.session_state.pop(k, None)
 
     # ── Filters ───────────────────────────────────────────────────────────────
@@ -1569,8 +1581,21 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         sel_trend  = fc6.selectbox("Date Trend",    trend_opts,  index=_idx(trend_opts,  vf.get("date_trend")),     key="reg_trend")
 
         # Responsible person filter — shown in a second row; primarily set via Gatekeeper navigation
-        fp1, _fp2 = st.columns([2, 4])
+        fp1, fp2, _fp3 = st.columns([2, 4, 1])
         sel_person = fp1.selectbox("Responsible Person", person_opts, index=_idx(person_opts, None), key="reg_person")
+
+        # Free-text search — partial, case-insensitive match across key fields.
+        # Scales to any number of documents; complementary to the dropdowns above.
+        search_query = fp2.text_input(
+            "Search",
+            placeholder="Filter by document ID, title, responsible person, or discipline...",
+            key="reg_search",
+            label_visibility="collapsed",
+            help=(
+                "Case-insensitive partial match across MDR ID, document title, "
+                "responsible person, and discipline. Works alongside the dropdown filters."
+            ),
+        )
 
     # Apply filters — each line narrows the DataFrame by one criterion
     filt = df.copy()
@@ -1583,10 +1608,20 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     if sel_trend  != "All": filt = filt[filt["date_trend"]          == sel_trend]
     if sel_person != "All": filt = filt[filt["responsible_person"]  == sel_person]
 
+    # Free-text search — applied last, on top of all dropdown filters
+    if search_query.strip():
+        q = search_query.strip().lower()
+        filt = filt[
+            filt["mdr_id"].str.lower().str.contains(q, na=False)
+            | filt["document_title"].str.lower().str.contains(q, na=False)
+            | filt["responsible_person"].str.lower().str.contains(q, na=False)
+            | filt["discipline"].str.lower().str.contains(q, na=False)
+        ]
+
     _log("FILTER", (
         f"disc={sel_disc} | rag={sel_rag} | prio={sel_prio} | "
         f"cp={sel_cp} | appr={sel_appr} | trend={sel_trend} | person={sel_person} "
-        f"-> {len(filt)} of {len(df)} rows"
+        f"| search='{search_query}' -> {len(filt)} of {len(df)} rows"
     ))
 
     # ── Column selector ───────────────────────────────────────────────────────
@@ -1630,13 +1665,12 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     display_df = filt_sorted[display_cols].copy().reset_index(drop=True)
     display_df.insert(1, "bookmarked", display_df["mdr_id"].isin(user_bm_ids))
 
-    # Trigger columns — boolean, always default False.  Checked immediately after the
-    # editor renders; the value is never written to the MDR CSV.
-    # open_detail: navigates same-tab to Document Detail for the checked row.
-    # view_source: pops a demo dialog explaining the CDE document link concept.
+    # Trigger columns — always False on display; the value is never written to CSV.
+    # Checking a cell fires the action (navigate / open dialog) on the next rerun.
+    # Streamlit's data_editor has no "link" cell type for internal navigation, so
+    # a CheckboxColumn is the only per-row trigger mechanism available.
     display_df.insert(1, "open_detail", False)
-    # Place view_source right after document_title if that column is visible;
-    # otherwise append at the end.
+    # Place view_source next to the title column if it is visible
     if "document_title" in display_df.columns:
         title_pos = list(display_df.columns).index("document_title")
         display_df.insert(title_pos + 1, "view_source", False)
@@ -1652,14 +1686,15 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     # ── Column config ─────────────────────────────────────────────────────────
     col_cfg = {
         "mdr_id":       st.column_config.TextColumn("ID", width="small", disabled=True),
-        # Trigger columns — checking fires an action; the value is never saved.
+        # Navigation trigger columns — check to fire action; value is never saved.
+        # Arrow label makes clear these are links, not data fields.
         "open_detail":  st.column_config.CheckboxColumn(
-            "-> Detail",
+            "->",
             width="small",
-            help="Check to open Document Detail for this document (same tab)",
+            help="Check to open Document Detail for this row (same tab)",
         ),
         "view_source":  st.column_config.CheckboxColumn(
-            "Src Doc",
+            "Src",
             width="small",
             help="Check to preview the source document link concept (demo popup)",
         ),
@@ -1696,16 +1731,16 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         num_rows="fixed",
     )
 
-    # ── Navigation triggers — checked first, before any persistence ──────────
-    # open_detail: navigate same-tab to Document Detail.
-    # view_source: pop the demo dialog explaining the CDE document link concept.
+    # ── Trigger column actions — checked first, before any persistence ──────────
+    # open_detail: check a row -> navigate to Document Detail.
+    # view_source: check a row -> open the source document demo dialog.
     # Both columns default to False and are never written to the MDR CSV.
     nav_rows = edited_df[edited_df["open_detail"].astype(bool)]
     if not nav_rows.empty:
         target_id = nav_rows.iloc[0]["mdr_id"]
         st.session_state["_nav_request"]    = "Document Detail"
         st.session_state["_detail_request"] = target_id
-        _log("LOAD", f"MDR Register: navigating to Document Detail for {target_id}")
+        _log("LOAD", f"MDR: navigating to Document Detail for {target_id}")
         st.rerun()
 
     src_rows = edited_df[edited_df["view_source"].astype(bool)]
@@ -1713,6 +1748,48 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         src_row   = src_rows.iloc[0]
         src_title = str(src_row.get("document_title", src_row["mdr_id"]))
         _source_doc_dialog(src_row["mdr_id"], src_title)
+
+    # ── Document Actions — alternative navigation for users who prefer not to ──
+    # use the trigger columns.  Selectbox lists all currently visible documents.
+    # Selecting one + clicking a button is equivalent to checking a trigger cell.
+    st.markdown('<hr style="border-color:#2a3040;margin:0.75rem 0 0.5rem 0;">', unsafe_allow_html=True)
+    action_opts = ["— select a document —"] + [
+        f'{r["mdr_id"]}  ·  {r.get("document_title", "")}' for _, r in display_df.iterrows()
+    ]
+    sel_col, det_col, src_col = st.columns([5, 1, 1])
+    with sel_col:
+        action_sel = st.selectbox(
+            "Document actions",
+            action_opts,
+            key="reg_action_sel",
+            label_visibility="collapsed",
+            help="Pick a document from the filtered list, then click Detail or Src Doc.",
+        )
+    action_disabled = action_sel.startswith("—")
+    with det_col:
+        if st.button(
+            "Detail ->",
+            key="reg_action_detail",
+            use_container_width=True,
+            disabled=action_disabled,
+            help="Open Document Detail for the selected document (same tab)",
+        ):
+            target_id = action_sel.split("  ·  ")[0].strip()
+            _log("LOAD", f"MDR Register: navigating to Document Detail for {target_id}")
+            st.session_state["_nav_request"]    = "Document Detail"
+            st.session_state["_detail_request"] = target_id
+            st.rerun()
+    with src_col:
+        if st.button(
+            "Src Doc ->",
+            key="reg_action_src",
+            use_container_width=True,
+            disabled=action_disabled,
+            help="Preview the CDE source document link concept (demo popup)",
+        ):
+            target_id    = action_sel.split("  ·  ")[0].strip()
+            target_title = "  ·  ".join(action_sel.split("  ·  ")[1:]).strip()
+            _source_doc_dialog(target_id, target_title)
 
     # ── Persist MDR edits ─────────────────────────────────────────────────────
     # RAG_TRIGGERS: editing either of these fields may change rag_status, so we
@@ -2222,6 +2299,13 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
     # We normalise it to a Python bool so comparisons and filtering work correctly.
     dq_raw["resolved"] = dq_raw["resolved"].astype(str).str.lower() == "true"
 
+    # resolved_by / resolved_at / resolved_note are all-null until a DC resolves a flag.
+    # pandas reads all-null columns as float64; casting to object lets us assign
+    # string values later without a TypeError.
+    for _col in ("resolved_by", "resolved_at", "resolved_note"):
+        if _col in dq_raw.columns:
+            dq_raw[_col] = dq_raw[_col].astype(object)
+
     n_total    = len(dq_raw)
     n_resolved = int(dq_raw["resolved"].sum())
     _log("LOAD", f"DQ flags loaded — {n_total} total, {n_resolved} resolved, {n_total - n_resolved} open")
@@ -2284,8 +2368,10 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
                 unsafe_allow_html=True,
             )
 
-    # ── Tabs: Remediation Queue | Pipeline Run Report ────────────────────────
-    tab_queue, tab_report = st.tabs(["DC Remediation Queue", "Pipeline Run Report"])
+    # ── Tabs: Remediation Queue | Pipeline Run Report | Resolution Audit Trail ─
+    tab_queue, tab_report, tab_audit = st.tabs([
+        "DC Remediation Queue", "Pipeline Run Report", "Resolution Audit Trail"
+    ])
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 1 — DC Remediation Queue
@@ -2516,6 +2602,83 @@ This distinction is the audit trail: every silent transformation is recorded her
                 width="stretch",
             )
 
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 3 — Resolution Audit Trail
+    # Shows every DQ_REMEDIATION event from edit_log.csv — the permanent record
+    # of who resolved which flag, when, and what corrected value they provided.
+    # ────────────────────────────────────────────────────────────────────────
+    with tab_audit:
+        st.markdown('<div class="section-header">Resolution Audit Trail — DQ Remediation Events</div>', unsafe_allow_html=True)
+
+        with st.expander("What is this?", expanded=False):
+            st.markdown("""
+**Where resolved flag values are stored:**
+
+When a Document Controller enters a correction value and clicks *Confirm Resolved*, two things happen:
+
+1. The flag is marked `resolved = True` in `staged_dq_flags.csv` — it leaves the remediation queue.
+2. The event (who, when, which document, which flag, what value was entered) is appended to `dashboard/edit_log.csv` — the permanent, append-only audit trail.
+
+This table shows only the DQ remediation entries from that log. In a live system, the corrected value would also be written back to the source system record.
+            """)
+
+        if not EDIT_LOG_CSV.exists():
+            st.info("No audit log yet — no edits have been made in this session.")
+        else:
+            _log("LOAD", f"Reading audit log for Resolution Audit Trail tab")
+            audit = pd.read_csv(EDIT_LOG_CSV)
+
+            # Filter to DQ remediation events only (field starts with "dq_flag_resolved:")
+            dq_audit = audit[audit["field"].str.startswith("dq_flag_resolved:", na=False)].copy()
+
+            if dq_audit.empty:
+                st.info("No DQ flag resolution events recorded yet. Resolve a flag in the DC Remediation Queue tab to see it here.")
+            else:
+                # Parse the flag ID out of the field column: "dq_flag_resolved:DQF-0001" -> "DQF-0001"
+                dq_audit["flag_id"] = dq_audit["field"].str.replace("dq_flag_resolved:", "", regex=False)
+
+                # Sort newest first
+                dq_audit = dq_audit.sort_values("timestamp", ascending=False).reset_index(drop=True)
+
+                st.markdown(
+                    f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.75rem 0;">'
+                    f'<b>{len(dq_audit)}</b> DQ remediation event(s) on record.</div>',
+                    unsafe_allow_html=True,
+                )
+
+                st.dataframe(
+                    dq_audit[["timestamp", "username", "mdr_id", "flag_id", "old_value", "new_value"]],
+                    column_config={
+                        "timestamp":  st.column_config.TextColumn("Resolved At",       width="medium"),
+                        "username":   st.column_config.TextColumn("Resolved By",       width="small"),
+                        "mdr_id":     st.column_config.TextColumn("Document (MDR ID)", width="medium"),
+                        "flag_id":    st.column_config.TextColumn("Flag",              width="small"),
+                        "old_value":  st.column_config.TextColumn("Original Value",    width="medium"),
+                        "new_value":  st.column_config.TextColumn("Corrected Value",   width="medium"),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                # Also show PM edits (non-DQ) as a secondary section so the full log is accessible
+                pm_audit = audit[~audit["field"].str.startswith("dq_flag_resolved:", na=False)].copy()
+                if not pm_audit.empty:
+                    with st.expander(f"Other dashboard edits ({len(pm_audit)} events — priority, critical path, notes)", expanded=False):
+                        pm_audit = pm_audit.sort_values("timestamp", ascending=False).reset_index(drop=True)
+                        st.dataframe(
+                            pm_audit[["timestamp", "username", "mdr_id", "field", "old_value", "new_value"]],
+                            column_config={
+                                "timestamp": st.column_config.TextColumn("Timestamp"),
+                                "username":  st.column_config.TextColumn("User",      width="small"),
+                                "mdr_id":    st.column_config.TextColumn("Document"),
+                                "field":     st.column_config.TextColumn("Field",     width="small"),
+                                "old_value": st.column_config.TextColumn("Old Value", width="medium"),
+                                "new_value": st.column_config.TextColumn("New Value", width="medium"),
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -2531,28 +2694,74 @@ def main():
     st.html("""
     <script>
     (function() {
-        /* 1 — Prevent Ctrl+C from triggering Streamlit's "Clear cache" shortcut.
-               Streamlit's handler fires on any 'c' keydown regardless of Ctrl.
-               We intercept in the capture phase and stop propagation only when
-               Ctrl or Meta is held; the browser's native copy action is unaffected. */
+        /* 1 — Prevent Ctrl+C from triggering Streamlit's "Clear cache" shortcut. */
         window.addEventListener('keydown', function(e) {
             if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
                 e.stopPropagation();
             }
         }, true);
 
-        /* 2 — Restore sidebar if localStorage left it collapsed.
-               [data-testid="collapsedControl"] is the expand arrow that Streamlit
-               renders in the main content area when the sidebar is closed.
-               It only exists in the DOM when the sidebar IS collapsed, so clicking
-               it is a no-op when the sidebar is already open.
-               We try twice with a delay to handle Streamlit's async render timing. */
-        function tryExpand() {
-            var btn = window.parent.document.querySelector('[data-testid="collapsedControl"]');
-            if (btn) btn.click();
+        /* 2 — Keep sidebar permanently open.
+               Two mechanisms work together:
+               a) hideCollapseBtn() finds the collapse arrow (the "<" button inside
+                  the sidebar) and hides it via inline style so the user cannot click
+                  it. We target window.parent.document because st.html() runs inside
+                  an iframe; the sidebar lives in the parent page.
+               b) A MutationObserver watches the parent DOM continuously. Whenever
+                  Streamlit collapses the sidebar it adds
+                  [data-testid="collapsedControl"] to the DOM (the ">" expand arrow
+                  in the main area). The observer sees that node appear and
+                  immediately clicks it to re-open the sidebar. A debounce timer
+                  (100 ms) prevents the observer from firing dozens of times during
+                  rapid Streamlit re-renders. A one-second cooldown after each
+                  expand-click prevents click loops. */
+        var doc = window.parent.document;
+        var _debounceTimer = null;
+        var _expandCooldown = false;
+
+        function hideCollapseBtn() {
+            /* Try both element+attribute and attribute-only selectors for
+               compatibility across Streamlit versions. */
+            ['button[data-testid="stSidebarCollapseButton"]',
+             '[data-testid="stSidebarCollapseButton"]'
+            ].forEach(function(sel) {
+                var btn = doc.querySelector(sel);
+                if (btn) {
+                    btn.style.display     = 'none';
+                    btn.style.visibility  = 'hidden';
+                    btn.style.pointerEvents = 'none';
+                }
+            });
         }
-        setTimeout(tryExpand, 300);
-        setTimeout(tryExpand, 900);
+
+        function expandIfCollapsed() {
+            if (_expandCooldown) return;
+            var expBtn = doc.querySelector('[data-testid="collapsedControl"]');
+            if (expBtn) {
+                _expandCooldown = true;
+                expBtn.click();
+                /* Reset cooldown after 1 s so a genuine re-collapse can be caught. */
+                setTimeout(function() { _expandCooldown = false; }, 1000);
+            }
+        }
+
+        function fixSidebar() {
+            hideCollapseBtn();
+            expandIfCollapsed();
+        }
+
+        /* Run on load — handle localStorage "collapsed" state and initial render. */
+        setTimeout(fixSidebar, 300);
+        setTimeout(fixSidebar, 900);
+        setTimeout(fixSidebar, 2000);
+
+        /* MutationObserver — runs on every DOM change (debounced to 100 ms) so
+           any mid-session collapse is caught and reversed immediately. */
+        new MutationObserver(function() {
+            clearTimeout(_debounceTimer);
+            _debounceTimer = setTimeout(fixSidebar, 100);
+        }).observe(doc.body, { childList: true, subtree: true });
+
     })();
     </script>
     """)
@@ -2581,7 +2790,7 @@ def main():
 
     if page == "Overview":
         page_overview(df, current_user, active_role)
-    elif page == "MDR Register":
+    elif page == "MDR":
         page_mdr_register(df, current_user, active_view, active_role)
     elif page == "My Watchlist":
         page_watchlist(df, current_user)
