@@ -36,8 +36,9 @@ MDR_CSV        = DATA_DIR / "mdr_requirements.csv"
 EDIT_LOG_CSV   = DASHBOARD_DIR / "edit_log.csv"
 BOOKMARKS_CSV  = DASHBOARD_DIR / "bookmarks.csv"
 SAVED_VIEWS_JSON = DASHBOARD_DIR / "saved_views.json"
-DQ_FLAGS_CSV         = DATA_DIR / "staged_dq_flags.csv"
-STAGED_EVENTS_CSV    = DATA_DIR / "staged_events.csv"
+DQ_FLAGS_CSV              = DATA_DIR / "staged_dq_flags.csv"
+STAGED_EVENTS_CSV         = DATA_DIR / "staged_events.csv"
+TRANSFORMATION_LOG_CSV    = DATA_DIR / "staged_transformation_log.csv"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -138,6 +139,15 @@ html, body, [class*="css"] {
 /* ── Hide default Streamlit chrome ── */
 #MainMenu, footer, header { visibility: hidden; }
 .block-container { padding: 1.5rem 2rem 2rem 2rem !important; }
+
+/* ── Remove sidebar collapse button ── */
+/* Hides only the collapse arrow INSIDE the sidebar so users cannot close it
+   accidentally. The expand arrow in the main content area is left untouched —
+   the JS in main() auto-clicks it on load to recover from any localStorage
+   "collapsed" state, so manual cache clearing is no longer required. */
+button[data-testid="stSidebarCollapseButton"] {
+    display: none !important;
+}
 
 /* ── App header bar ── */
 .app-header {
@@ -434,6 +444,53 @@ ROLES                    = [ROLE_READ_ONLY, ROLE_PROJECT_MANAGER, ROLE_DOCUMENT_
 # Canonical hex values used in tiles and inline styles across all pages.
 RAG_COLOR_MAP = {"RED": "#ef4444", "AMBER": "#f59e0b", "GREEN": "#22c55e"}
 
+# RAG threshold tables — must stay in sync with generate_mdr_layer.py.
+# These are the source of truth for live in-session recomputation.
+RAG_THRESHOLDS = {
+    #                AMBER  RED
+    "Very High": (21,       7),
+    "High":      (14,       3),
+    "Medium":    ( 7,       0),
+    "Low":       ( 7,    -180),
+}
+CRITICAL_PATH_THRESHOLDS = (14, 3)   # Option B: tight tier applied when is_on_critical_path=True
+TERMINAL_STATUSES = {
+    "APPROVED_FINAL", "APPROVED_CUSTOMER", "APPROVED_AUTHORITY",
+    "APPROVED_CERTIFICATION", "SUPERSEDED",
+}
+
+
+def derive_rag(float_days: int, priority: str, canonical_status: str,
+               is_on_critical_path: bool = False) -> str:
+    """Compute RAG status — mirrors generate_mdr_layer.derive_rag() exactly.
+
+    Used for live in-session recomputation when the user changes priority or
+    is_on_critical_path in the MDR Register. The result is never written to the
+    CSV — rag_status is always derived, never stored permanently by the dashboard.
+
+    Args:
+        float_days:          (planned_approval_date - TODAY).days.
+        priority:            Very High / High / Medium / Low.
+        canonical_status:    Current lifecycle status string.
+        is_on_critical_path: Applies the Critical Path tier when True.
+
+    Returns:
+        "RED", "AMBER", or "GREEN".
+    """
+    if canonical_status in TERMINAL_STATUSES:
+        return "GREEN"
+    if canonical_status == "OVERDUE":
+        return "RED"
+    if is_on_critical_path:
+        amber_thresh, red_thresh = CRITICAL_PATH_THRESHOLDS
+    else:
+        amber_thresh, red_thresh = RAG_THRESHOLDS.get(priority, (7, 0))
+    if float_days <= red_thresh:
+        return "RED"
+    if float_days <= amber_thresh:
+        return "AMBER"
+    return "GREEN"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PERSISTENCE HELPERS
@@ -460,7 +517,35 @@ def load_mdr() -> pd.DataFrame:
 
     df = pd.read_csv(MDR_CSV, parse_dates=["planned_submission_date", "planned_approval_date",
                                             "baseline_approval_date", "previous_approval_date"])
-    _log("LOAD", f"MDR loaded — {len(df)} rows × {len(df.columns)} columns")
+    _log("LOAD", f"MDR loaded — {len(df)} rows x {len(df.columns)} columns")
+
+    # Always recompute rag_status from current field values — it is a derived field,
+    # not a stored one.  This ensures the Option B critical-path tier is applied
+    # without needing a pipeline re-run, and that any priority changes saved by the PM
+    # are reflected immediately on the next load.
+    def _cp(val):
+        """Safely coerce is_on_critical_path to bool regardless of CSV dtype."""
+        if isinstance(val, bool):
+            return val
+        return str(val).lower() == "true"
+
+    df["rag_status"] = df.apply(
+        lambda row: derive_rag(
+            int(row["schedule_float_days"]) if pd.notna(row.get("schedule_float_days")) else 0,
+            str(row.get("priority", "Medium")),
+            str(row.get("current_canonical_status", "")),
+            _cp(row.get("is_on_critical_path", False)),
+        ),
+        axis=1,
+    )
+
+    # A 100%-complete or terminal-status document cannot logically be "SLIPPING" —
+    # its schedule is irrelevant once the work is done.  Force date_trend to STABLE.
+    completed_mask = (
+        (pd.to_numeric(df["reported_percent_complete"], errors="coerce").fillna(0) >= 100) |
+        (df["current_canonical_status"].isin(TERMINAL_STATUSES))
+    )
+    df.loc[completed_mask, "date_trend"] = "STABLE"
 
     if DEBUG:
         # Extra detail: RAG breakdown lets you verify the data looks right at a glance
@@ -558,7 +643,7 @@ def log_edit(username: str, mdr_id: str, field: str, old_val, new_val):
         old_val:  The previous value (any type — converted to str for storage).
         new_val:  The new value (any type — converted to str for storage).
     """
-    _log("EDIT", f"{username} | {mdr_id} | {field}: '{old_val}' → '{new_val}'")
+    _log("EDIT", f"{username} | {mdr_id} | {field}: '{old_val}' -> '{new_val}'")
 
     row = {
         "timestamp":  str(datetime.now(timezone.utc)),
@@ -810,6 +895,12 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
     # Streamlit sees the new value before the widget is instantiated (setting a widget
     # key after the widget has rendered raises StreamlitAPIException).
     if "_nav_request" in st.session_state:
+        # Push current page to history before navigating so "← Back" can return here.
+        nav_history = st.session_state.setdefault("_nav_history", [])
+        nav_history.append({
+            "page":   st.session_state.get("nav_page", "Overview"),
+            "detail": st.session_state.get("detail_doc_select"),
+        })
         st.session_state["nav_page"] = st.session_state.pop("_nav_request")
     if "_detail_request" in st.session_state:
         st.session_state["detail_doc_select"] = st.session_state.pop("_detail_request")
@@ -901,6 +992,25 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
             help="Switch between dashboard pages.",
         )
 
+        # Back button — always visible; disabled when no history.
+        # History is populated whenever a link, tile, or action button navigates
+        # programmatically (via _nav_request). Direct radio clicks are not tracked
+        # because the user is explicitly choosing a page, not following a link.
+        nav_history = st.session_state.get("_nav_history", [])
+        if st.button(
+            "<- Back",
+            key="btn_back",
+            width="stretch",
+            disabled=not nav_history,
+            help="Return to the previous page (only available after following a link or tile)",
+        ):
+            prev = nav_history.pop()
+            st.session_state["_nav_history"] = nav_history
+            st.session_state["nav_page"]     = prev["page"]
+            if prev["detail"]:
+                st.session_state["detail_doc_select"] = prev["detail"]
+            st.rerun()
+
         st.divider()
 
         # ── Saved Views ───────────────────────────────────────────────────────
@@ -952,7 +1062,11 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
         )
 
         st.divider()
-        if st.button("🔄 Refresh data", width="stretch"):
+        if st.button("Reset to pipeline state", width="stretch",
+                     help="Discard in-session edits and reload from the pipeline CSV. "
+                          "Saved changes (notes, % complete) are preserved on disk."):
+            # Drop the working copy — next render re-reads CSV and recomputes RAG fresh.
+            st.session_state.pop("mdr_working", None)
             st.cache_data.clear()
             st.rerun()
 
@@ -1065,27 +1179,39 @@ Controls what you can edit in this session:
     # Buttons sit in four columns to align under each tile.
     # reg_rag is a filter widget key in page_mdr_register — setting it here
     # works because that widget hasn't been rendered yet (we're on Overview).
+    def _nav_to_register(rag_val=None, trend_val=None, disc_val=None, person_val=None):
+        """Navigate to MDR Register with specific filters pre-set, all others reset to All.
+
+        Resetting the other filter keys prevents cross-contamination from discipline
+        pre-filters (e.g. sarah.chen has reg_disc=Instrumentation) which would otherwise
+        silently reduce '12 RED' to '2 RED' by intersecting with the user discipline filter.
+        """
+        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person"):
+            st.session_state[k] = "All"
+        if rag_val:
+            st.session_state["reg_rag"]    = rag_val
+        if trend_val:
+            st.session_state["reg_trend"]  = trend_val
+        if disc_val:
+            st.session_state["reg_disc"]   = disc_val
+        if person_val:
+            st.session_state["reg_person"] = person_val
+        st.session_state["_nav_request"] = "MDR Register"
+        st.rerun()
+
     btn_r, btn_a, btn_g, btn_t = st.columns(4)
     with btn_r:
         if st.button(f"View {rag['RED']} RED ->", key="ov_nav_red"):
-            st.session_state["reg_rag"]      = "RED"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(rag_val="RED")
     with btn_a:
         if st.button(f"View {rag['AMBER']} AMBER ->", key="ov_nav_amber"):
-            st.session_state["reg_rag"]      = "AMBER"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(rag_val="AMBER")
     with btn_g:
         if st.button(f"View {rag['GREEN']} GREEN ->", key="ov_nav_green"):
-            st.session_state["reg_rag"]      = "GREEN"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(rag_val="GREEN")
     with btn_t:
         if st.button(f"View all {rag['TOTAL']} ->", key="ov_nav_all"):
-            st.session_state["reg_rag"]      = "All"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register()
 
     # ── RAG legend ────────────────────────────────────────────────────────────
     st.markdown(
@@ -1101,12 +1227,6 @@ Controls what you can edit in this session:
     st.markdown('<div class="section-header">Date Trend</div>', unsafe_allow_html=True)
     trend = compute_trend_counts(df)
 
-    slip_avg = df[df["date_trend"] == "SLIPPING"]["total_slip_days"].mean()
-    slip_avg_str = f"avg slip {slip_avg:.0f}d" if not pd.isna(slip_avg) else ""
-
-    stall_avg = df[df["date_trend"] == "STALLED"]["total_slip_days"].mean()
-    stall_avg_str = f"avg slip {stall_avg:.0f}d" if not pd.isna(stall_avg) else ""
-
     st.markdown(f"""
     <div class="trend-grid">
         <div class="trend-tile slipping">
@@ -1114,7 +1234,7 @@ Controls what you can edit in this session:
             <div>
                 <div class="t-count">{trend['SLIPPING']}</div>
                 <div class="t-label">Slipping</div>
-                <div class="t-sub">{slip_avg_str}</div>
+                <div class="t-sub">&nbsp;</div>
             </div>
         </div>
         <div class="trend-tile stalled">
@@ -1122,7 +1242,7 @@ Controls what you can edit in this session:
             <div>
                 <div class="t-count">{trend['STALLED']}</div>
                 <div class="t-label">Stalled</div>
-                <div class="t-sub">{stall_avg_str}</div>
+                <div class="t-sub">&nbsp;</div>
             </div>
         </div>
         <div class="trend-tile recovering">
@@ -1148,24 +1268,16 @@ Controls what you can edit in this session:
     tb_sl, tb_st, tb_re, tb_sta = st.columns(4)
     with tb_sl:
         if st.button(f"View {trend['SLIPPING']} Slipping ->", key="ov_nav_slip"):
-            st.session_state["reg_trend"]    = "SLIPPING"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(trend_val="SLIPPING")
     with tb_st:
         if st.button(f"View {trend['STALLED']} Stalled ->", key="ov_nav_stall"):
-            st.session_state["reg_trend"]    = "STALLED"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(trend_val="STALLED")
     with tb_re:
         if st.button(f"View {trend['RECOVERING']} Recovering ->", key="ov_nav_rec"):
-            st.session_state["reg_trend"]    = "RECOVERING"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(trend_val="RECOVERING")
     with tb_sta:
         if st.button(f"View {trend['STABLE']} Stable ->", key="ov_nav_stable"):
-            st.session_state["reg_trend"]    = "STABLE"
-            st.session_state["_nav_request"] = "MDR Register"
-            st.rerun()
+            _nav_to_register(trend_val="STABLE")
 
     # ── Date trend legend ─────────────────────────────────────────────────────
     st.markdown(
@@ -1192,48 +1304,38 @@ Controls what you can edit in this session:
         if crit.empty:
             st.markdown('<p style="color:#4a5568; font-size:0.8rem;">No critical path items at RED or AMBER.</p>', unsafe_allow_html=True)
         else:
-            rows_html = ""
-            for _, row in crit.iterrows():
-                float_html = format_float(row.get("schedule_float_days", ""))
-                rag_html   = rag_badge(row.get("rag_status", ""))
-                trend_val  = row.get("date_trend", "")
-                trend_icon = {"SLIPPING": "📉", "STALLED": "⏸", "RECOVERING": "📈", "STABLE": "→"}.get(trend_val, "")
-                slip       = row.get("total_slip_days", "")
-                slip_str   = f'+{int(slip)}d slip' if pd.notna(slip) and str(slip) != "" else ""
-                title      = str(row.get("document_title", ""))[:45] + ("…" if len(str(row.get("document_title", ""))) > 45 else "")
-                disc       = row.get("discipline", "")[:3].upper()
-                prio       = row.get("priority", "")
-                person     = row.get("responsible_person", "—")
-                person_short = person.split()[0] if person else "—"
+            # Build a display table — trend icons added as a plain text column
+            TREND_ICON = {"SLIPPING": "📉 Slipping", "STALLED": "⏸ Stalled",
+                          "RECOVERING": "📈 Recovering", "STABLE": "Stable"}
+            crit_display = crit[[
+                "mdr_id", "document_title", "discipline", "rag_status",
+                "schedule_float_days", "date_trend", "responsible_person",
+            ]].copy()
+            crit_display["date_trend"] = crit_display["date_trend"].map(TREND_ICON).fillna("")
 
-                rows_html += f"""
-                <tr>
-                    <td style="font-family:'IBM Plex Mono',monospace; font-size:0.7rem; color:#7a8499;">{row.get('mdr_id','')}</td>
-                    <td>
-                        <div style="color:#e8ecf4; font-size:0.78rem;">{title}</div>
-                        <div style="color:#4a5568; font-size:0.68rem; margin-top:1px;">{disc} · {prio}</div>
-                    </td>
-                    <td>{rag_html}</td>
-                    <td>{float_html}</td>
-                    <td style="font-size:0.72rem;">{trend_icon} {slip_str}</td>
-                    <td style="color:#7a8499; font-size:0.72rem;">{person_short}</td>
-                </tr>"""
-
-            st.markdown(f"""
-            <table class="crit-table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Document</th>
-                        <th>RAG</th>
-                        <th>Float</th>
-                        <th>Trend</th>
-                        <th>Lead</th>
-                    </tr>
-                </thead>
-                <tbody>{rows_html}</tbody>
-            </table>
-            """, unsafe_allow_html=True)
+            st.caption("Click a row to open Document Detail for that document.")
+            evt = st.dataframe(
+                crit_display,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config={
+                    "mdr_id":              st.column_config.TextColumn("ID",         width="small"),
+                    "document_title":      st.column_config.TextColumn("Document",   width="large"),
+                    "discipline":          st.column_config.TextColumn("Disc.",       width="small"),
+                    "rag_status":          st.column_config.TextColumn("RAG",         width="small"),
+                    "schedule_float_days": st.column_config.NumberColumn("Float (d)", format="%d"),
+                    "date_trend":          st.column_config.TextColumn("Trend",       width="medium"),
+                    "responsible_person":  st.column_config.TextColumn("Lead",        width="medium"),
+                },
+            )
+            # Row click triggers navigation to Document Detail
+            if evt.selection.rows:
+                selected_id = crit_display.iloc[evt.selection.rows[0]]["mdr_id"]
+                st.session_state["_nav_request"]    = "Document Detail"
+                st.session_state["_detail_request"] = selected_id
+                st.rerun()
 
     with col_right:
         # Gatekeeper heatmap is restricted to PM and DC — it names individuals who
@@ -1263,24 +1365,36 @@ Controls what you can edit in this session:
             )
             max_count = gk_counts.max()
 
-            rows_html = ""
             for person, count in gk_counts.items():
                 bar_width = int(100 * count / max_count)
                 bar_color = gk_bar_color(count, max_count)
-                rows_html += f"""
-                <div class="gk-row">
-                    <div class="gk-name">{person}</div>
-                    <div class="gk-bar-bg">
-                        <div class="gk-bar-fill" style="width:{bar_width}%; background:{bar_color};"></div>
-                    </div>
-                    <div class="gk-count">{count} doc{"s" if count != 1 else ""}</div>
-                </div>"""
-
-            st.markdown(f'<div class="gk-grid">{rows_html}</div>', unsafe_allow_html=True)
+                # Render bar as HTML, then place a native button in the same row
+                bar_col, btn_col = st.columns([5, 1])
+                with bar_col:
+                    st.markdown(
+                        f'<div class="gk-row">'
+                        f'<div class="gk-name">{person}</div>'
+                        f'<div class="gk-bar-bg">'
+                        f'<div class="gk-bar-fill" style="width:{bar_width}%;background:{bar_color};"></div>'
+                        f'</div>'
+                        f'<div class="gk-count">{count} doc{"s" if count != 1 else ""}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with btn_col:
+                    if st.button(
+                        "View ->",
+                        key=f"gk_nav_{person}",
+                        use_container_width=True,
+                        help=f"Show stalled documents for {person} in MDR Register",
+                    ):
+                        # Filter by person + STALLED — exact match on responsible_person,
+                        # not discipline, to avoid picking up other people's stalled docs.
+                        _nav_to_register(trend_val="STALLED", person_val=person)
 
             st.markdown(
                 f'<div style="font-size:0.68rem; color:#4a5568; margin-top:0.9rem; font-family:\'IBM Plex Mono\',monospace;">'
-                f'STALLED = total slip &gt;14d AND recent slip within ±5d. Indicates resource bottleneck.</div>',
+                f'STALLED = total slip &gt;14d AND recent slip within +-5d. Indicates resource bottleneck.</div>',
                 unsafe_allow_html=True
             )
 
@@ -1318,6 +1432,14 @@ Controls what you can edit in this session:
                 </div>
             </div>
             """, unsafe_allow_html=True)
+            # Navigation button — filters MDR Register to this discipline
+            if st.button(
+                f"View {row['discipline']} ->",
+                key=f"disc_nav_{row['discipline']}",
+                use_container_width=True,
+                help=f"Open MDR Register filtered to {row['discipline']} documents",
+            ):
+                _nav_to_register(disc_val=row["discipline"])
 
     # ── Pipeline Flags summary ────────────────────────────────────────────────
     # Show a quick count of unresolved DQ flags by type so users know at a
@@ -1357,11 +1479,14 @@ Controls what you can edit in this session:
                         <div style="font-size:0.68rem; color:#7a8499;">flags</div>
                     </div>
                     """, unsafe_allow_html=True)
-            st.markdown(
-                '<div style="font-size:0.68rem; color:#4a5568; margin-top:0.5rem;">'
-                'Document Controller action required. Go to <b>Source System Health</b> to review and resolve.</div>',
-                unsafe_allow_html=True
-            )
+            if st.button(
+                f"Resolve {total_unresolved} flag(s) in Source System Health ->",
+                key="flags_nav_health",
+                use_container_width=False,
+                help="Open the DC Remediation Queue in Source System Health",
+            ):
+                st.session_state["_nav_request"] = "Source System Health"
+                st.rerun()
     else:
         st.caption("staged_dq_flags.csv not found — run generate_staged_layer.py to populate.")
 
@@ -1418,44 +1543,50 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     # Reset filter widget state when the active view changes so new defaults apply
     if st.session_state.get("_reg_view") != active_view:
         st.session_state["_reg_view"] = active_view
-        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_cols"):
+        for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person", "reg_cols"):
             st.session_state.pop(k, None)
 
     # ── Filters ───────────────────────────────────────────────────────────────
     with st.expander("Filters", expanded=True):
         fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
 
-        disc_opts  = ["All"] + sorted(df["discipline"].dropna().unique().tolist())
-        rag_opts   = ["All", "RED", "AMBER", "GREEN"]
-        prio_opts  = ["All", "Very High", "High", "Medium", "Low"]
-        cp_opts    = ["All", "Critical Path only", "Non-critical only"]
-        appr_opts  = ["All"] + sorted(df["approval_class"].dropna().unique().tolist())
-        trend_opts = ["All", "SLIPPING", "STALLED", "RECOVERING", "STABLE"]
+        disc_opts   = ["All"] + sorted(df["discipline"].dropna().unique().tolist())
+        rag_opts    = ["All", "RED", "AMBER", "GREEN"]
+        prio_opts   = ["All", "Very High", "High", "Medium", "Low"]
+        cp_opts     = ["All", "Critical Path only", "Non-critical only"]
+        appr_opts   = ["All"] + sorted(df["approval_class"].dropna().unique().tolist())
+        trend_opts  = ["All", "SLIPPING", "STALLED", "RECOVERING", "STABLE"]
+        person_opts = ["All"] + sorted(df["responsible_person"].dropna().unique().tolist())
 
         def _idx(lst, val): return lst.index(val) if val in lst else 0
 
-        sel_disc  = fc1.selectbox("Discipline",    disc_opts,  index=_idx(disc_opts,  vf.get("discipline")),     key="reg_disc")
-        sel_rag   = fc2.selectbox("RAG",           rag_opts,   index=_idx(rag_opts,   vf.get("rag_status")),     key="reg_rag")
-        sel_prio  = fc3.selectbox("Priority",      prio_opts,  index=_idx(prio_opts,  vf.get("priority")),       key="reg_prio")
-        vf_cp_val = "Critical Path only" if vf.get("is_on_critical_path") is True else ("Non-critical only" if vf.get("is_on_critical_path") is False else "All")
-        sel_cp    = fc4.selectbox("Critical Path", cp_opts,    index=_idx(cp_opts,    vf_cp_val),                key="reg_cp")
-        sel_appr  = fc5.selectbox("Approval",      appr_opts,  index=_idx(appr_opts,  vf.get("approval_class")), key="reg_appr")
-        sel_trend = fc6.selectbox("Date Trend",    trend_opts, index=_idx(trend_opts, vf.get("date_trend")),     key="reg_trend")
+        sel_disc   = fc1.selectbox("Discipline",    disc_opts,   index=_idx(disc_opts,   vf.get("discipline")),     key="reg_disc")
+        sel_rag    = fc2.selectbox("RAG",           rag_opts,    index=_idx(rag_opts,    vf.get("rag_status")),     key="reg_rag")
+        sel_prio   = fc3.selectbox("Priority",      prio_opts,   index=_idx(prio_opts,   vf.get("priority")),       key="reg_prio")
+        vf_cp_val  = "Critical Path only" if vf.get("is_on_critical_path") is True else ("Non-critical only" if vf.get("is_on_critical_path") is False else "All")
+        sel_cp     = fc4.selectbox("Critical Path", cp_opts,     index=_idx(cp_opts,     vf_cp_val),                key="reg_cp")
+        sel_appr   = fc5.selectbox("Approval",      appr_opts,   index=_idx(appr_opts,   vf.get("approval_class")), key="reg_appr")
+        sel_trend  = fc6.selectbox("Date Trend",    trend_opts,  index=_idx(trend_opts,  vf.get("date_trend")),     key="reg_trend")
+
+        # Responsible person filter — shown in a second row; primarily set via Gatekeeper navigation
+        fp1, _fp2 = st.columns([2, 4])
+        sel_person = fp1.selectbox("Responsible Person", person_opts, index=_idx(person_opts, None), key="reg_person")
 
     # Apply filters — each line narrows the DataFrame by one criterion
     filt = df.copy()
-    if sel_disc  != "All": filt = filt[filt["discipline"]        == sel_disc]
-    if sel_rag   != "All": filt = filt[filt["rag_status"]        == sel_rag]
-    if sel_prio  != "All": filt = filt[filt["priority"]          == sel_prio]
+    if sel_disc   != "All": filt = filt[filt["discipline"]          == sel_disc]
+    if sel_rag    != "All": filt = filt[filt["rag_status"]          == sel_rag]
+    if sel_prio   != "All": filt = filt[filt["priority"]            == sel_prio]
     if sel_cp    == "Critical Path only": filt = filt[filt["is_on_critical_path"] == True]
     elif sel_cp  == "Non-critical only":  filt = filt[filt["is_on_critical_path"] != True]
-    if sel_appr  != "All": filt = filt[filt["approval_class"]    == sel_appr]
-    if sel_trend != "All": filt = filt[filt["date_trend"]        == sel_trend]
+    if sel_appr   != "All": filt = filt[filt["approval_class"]      == sel_appr]
+    if sel_trend  != "All": filt = filt[filt["date_trend"]          == sel_trend]
+    if sel_person != "All": filt = filt[filt["responsible_person"]  == sel_person]
 
     _log("FILTER", (
         f"disc={sel_disc} | rag={sel_rag} | prio={sel_prio} | "
-        f"cp={sel_cp} | appr={sel_appr} | trend={sel_trend} "
-        f"→ {len(filt)} of {len(df)} rows"
+        f"cp={sel_cp} | appr={sel_appr} | trend={sel_trend} | person={sel_person} "
+        f"-> {len(filt)} of {len(df)} rows"
     ))
 
     # ── Column selector ───────────────────────────────────────────────────────
@@ -1499,9 +1630,10 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     display_df = filt_sorted[display_cols].copy().reset_index(drop=True)
     display_df.insert(1, "bookmarked", display_df["mdr_id"].isin(user_bm_ids))
 
-    # Navigation trigger columns — boolean, never persisted, checked immediately
-    # after the editor renders.  open_detail navigates same-tab to Document Detail.
-    # view_source pops a demo dialog explaining the CDE document link concept.
+    # Trigger columns — boolean, always default False.  Checked immediately after the
+    # editor renders; the value is never written to the MDR CSV.
+    # open_detail: navigates same-tab to Document Detail for the checked row.
+    # view_source: pops a demo dialog explaining the CDE document link concept.
     display_df.insert(1, "open_detail", False)
     # Place view_source right after document_title if that column is visible;
     # otherwise append at the end.
@@ -1520,7 +1652,7 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     # ── Column config ─────────────────────────────────────────────────────────
     col_cfg = {
         "mdr_id":       st.column_config.TextColumn("ID", width="small", disabled=True),
-        # Trigger columns — checking the box fires an action; the value is never saved.
+        # Trigger columns — checking fires an action; the value is never saved.
         "open_detail":  st.column_config.CheckboxColumn(
             "-> Detail",
             width="small",
@@ -1529,7 +1661,7 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         "view_source":  st.column_config.CheckboxColumn(
             "Src Doc",
             width="small",
-            help="Check to preview the source document link (demo)",
+            help="Check to preview the source document link concept (demo popup)",
         ),
         "bookmarked":   st.column_config.CheckboxColumn("⭐", width="small", help="Add to My Watchlist"),
         "document_title": st.column_config.TextColumn("Title", width="large", disabled=True),
@@ -1565,8 +1697,8 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     )
 
     # ── Navigation triggers — checked first, before any persistence ──────────
-    # open_detail: navigate same-tab to Document Detail for the checked row.
-    # view_source: pop the _source_doc_dialog explaining the demo constraint.
+    # open_detail: navigate same-tab to Document Detail.
+    # view_source: pop the demo dialog explaining the CDE document link concept.
     # Both columns default to False and are never written to the MDR CSV.
     nav_rows = edited_df[edited_df["open_detail"].astype(bool)]
     if not nav_rows.empty:
@@ -1583,7 +1715,15 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         _source_doc_dialog(src_row["mdr_id"], src_title)
 
     # ── Persist MDR edits ─────────────────────────────────────────────────────
-    has_changes = False
+    # RAG_TRIGGERS: editing either of these fields may change rag_status, so we
+    # recompute it for the affected rows after writing the new field value to df.
+    # df is st.session_state["mdr_working"] (same object, passed by reference), so
+    # updating df here updates the working copy without an extra assignment.
+    RAG_TRIGGERS = {"priority", "is_on_critical_path"}
+
+    has_changes     = False
+    rag_recompute_ids = set()   # mdr_ids whose RAG needs recomputing this cycle
+
     for edit_col in EDITABLE_COLS:
         if edit_col not in display_df.columns:
             continue
@@ -1597,7 +1737,27 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
                 new_val = row[edit_col]
                 df.loc[df["mdr_id"] == mdr_id, edit_col] = new_val
                 log_edit(current_user, mdr_id, edit_col, old_val, new_val)
+                if edit_col in RAG_TRIGGERS:
+                    rag_recompute_ids.add(mdr_id)
             has_changes = True
+
+    # Recompute rag_status for any document where a RAG-triggering field changed.
+    # Reading from df (already updated above) so the new priority / critical_path
+    # value is used, not the old display_df value.
+    for mid in rag_recompute_ids:
+        mask = df["mdr_id"] == mid
+        row  = df[mask].iloc[0]
+        cp   = row["is_on_critical_path"]
+        cp   = cp if isinstance(cp, bool) else str(cp).lower() == "true"
+        new_rag = derive_rag(
+            int(row["schedule_float_days"]) if pd.notna(row.get("schedule_float_days")) else 0,
+            str(row["priority"]),
+            str(row["current_canonical_status"]),
+            cp,
+        )
+        df.loc[mask, "rag_status"] = new_rag
+        _log("EDIT", f"RAG recomputed for {mid}: {new_rag} (priority={row['priority']}, cp={cp})")
+
     if has_changes:
         save_mdr(df)
         st.toast("Changes saved.", icon="✅")
@@ -2124,90 +2284,237 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
                 unsafe_allow_html=True,
             )
 
-    # ── Section 2: Remediation queue ─────────────────────────────────────────
-    st.markdown('<div class="section-header">Remediation Queue — Unresolved Flags</div>', unsafe_allow_html=True)
+    # ── Tabs: Remediation Queue | Pipeline Run Report ────────────────────────
+    tab_queue, tab_report = st.tabs(["DC Remediation Queue", "Pipeline Run Report"])
 
-    # Role notice — only DCs can mark flags as resolved
-    is_dc = (active_role == ROLE_DOCUMENT_CONTROLLER)
-    if is_dc:
-        st.success(f"{ROLE_DOCUMENT_CONTROLLER} — tick the 'Resolved' checkbox to mark a flag as fixed.")
-    else:
-        st.info(f"Read Only — switch to {ROLE_DOCUMENT_CONTROLLER} in the sidebar to resolve DQ flags.")
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 1 — DC Remediation Queue
+    # ────────────────────────────────────────────────────────────────────────
+    with tab_queue:
+        st.markdown('<div class="section-header">Remediation Queue — Unresolved Flags</div>', unsafe_allow_html=True)
 
-    # ── Filter controls ───────────────────────────────────────────────────────
-    fc1, fc2, _ = st.columns([2, 3, 3])
-    src_options  = ["All"] + sorted(dq_raw["source_system"].dropna().unique().tolist())
-    type_options = ["All"] + sorted(dq_raw["flag_type"].dropna().unique().tolist())
-    sel_src  = fc1.selectbox("Source system", src_options,  key="health_src_filter")
-    sel_type = fc2.selectbox("Flag type",     type_options, key="health_type_filter")
+        # Role notice — only DCs can resolve flags
+        is_dc = (active_role == ROLE_DOCUMENT_CONTROLLER)
+        if is_dc:
+            st.success(f"{ROLE_DOCUMENT_CONTROLLER} — expand a flag below to fill in the corrected value and confirm resolution.")
+        else:
+            st.info(f"Read Only — switch to {ROLE_DOCUMENT_CONTROLLER} in the sidebar to resolve DQ flags.")
 
-    # Always show only unresolved flags in the remediation queue
-    queue = dq_raw[~dq_raw["resolved"]].copy()
-    if sel_src  != "All":
-        queue = queue[queue["source_system"] == sel_src]
-    if sel_type != "All":
-        queue = queue[queue["flag_type"] == sel_type]
+        # ── Filter controls ───────────────────────────────────────────────────────
+        fc1, fc2, _ = st.columns([2, 3, 3])
+        src_options  = ["All"] + sorted(dq_raw["source_system"].dropna().unique().tolist())
+        type_options = ["All"] + sorted(dq_raw["flag_type"].dropna().unique().tolist())
+        sel_src  = fc1.selectbox("Source system", src_options,  key="health_src_filter")
+        sel_type = fc2.selectbox("Flag type",     type_options, key="health_type_filter")
 
-    _log("FILTER", f"Health queue — src={sel_src} type={sel_type} -> {len(queue)} flags")
+        # Always show only unresolved flags in the remediation queue
+        queue = dq_raw[~dq_raw["resolved"]].copy()
+        if sel_src  != "All":
+            queue = queue[queue["source_system"] == sel_src]
+        if sel_type != "All":
+            queue = queue[queue["flag_type"] == sel_type]
 
-    st.markdown(
-        f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
-        f'Showing <b>{len(queue)}</b> unresolved flags</div>',
-        unsafe_allow_html=True,
-    )
+        _log("FILTER", f"Health queue — src={sel_src} type={sel_type} -> {len(queue)} flags")
 
-    if queue.empty:
-        st.success("No unresolved flags for the selected filters — all clear.")
-        return
+        st.markdown(
+            f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
+            f'Showing <b>{len(queue)}</b> unresolved flags</div>',
+            unsafe_allow_html=True,
+        )
 
-    # ── Remediation table ─────────────────────────────────────────────────────
-    # Columns shown in the drilldown. flag_detail is last as it's the longest field.
-    QUEUE_COLS = [
-        "flag_id", "source_system", "mdr_id", "field_name",
-        "flag_type", "original_value", "suggested_value", "resolved", "flag_detail",
-    ]
-    queue_display = queue[QUEUE_COLS].reset_index(drop=True)
-    queue_orig    = queue_display.copy()  # snapshot for change detection
+        if queue.empty:
+            st.success("No unresolved flags for the selected filters — all clear.")
+        else:
+            # ── Per-flag resolution cards ─────────────────────────────────────────────
+            # Each flag is an expander.  DCs see a value input + Confirm button inside.
+            # In a real system the confirmed value would update the source system record;
+            # here it is captured in the audit log (edit_log.csv) and the flag is closed.
+            for _, row in queue.iterrows():
+                flag_id  = str(row["flag_id"])
+                ftype    = str(row.get("flag_type",      ""))
+                field    = str(row.get("field_name",     "—"))
+                orig     = str(row.get("original_value", ""))
+                sugg     = str(row.get("suggested_value",""))
+                detail   = str(row.get("flag_detail",    ""))
+                mdr_id   = str(row.get("mdr_id",         ""))
+                src_sys  = str(row.get("source_system",  ""))
 
-    queue_col_cfg = {
-        "flag_id":         st.column_config.TextColumn("Flag ID",      width="small",  disabled=True),
-        "source_system":   st.column_config.TextColumn("Source",       width="small",  disabled=True),
-        "mdr_id":          st.column_config.TextColumn("MDR ID",                       disabled=True),
-        "field_name":      st.column_config.TextColumn("Field",        width="small",  disabled=True),
-        "flag_type":       st.column_config.TextColumn("Flag Type",                    disabled=True),
-        "original_value":  st.column_config.TextColumn("Original",     width="small",  disabled=True),
-        "suggested_value": st.column_config.TextColumn("Suggested",    width="small",  disabled=True),
-        # Only Document Controllers can tick this checkbox
-        "resolved":        st.column_config.CheckboxColumn("Resolved",                 disabled=not is_dc),
-        "flag_detail":     st.column_config.TextColumn("Detail",       width="large",  disabled=True),
-    }
+                label = f"{flag_id}  |  {src_sys}  |  {ftype}  |  field: {field}"
+                with st.expander(label, expanded=False):
+                    # Flag metadata
+                    m1, m2, m3 = st.columns(3)
+                    m1.markdown(f"**Document:** `{mdr_id}`")
+                    m2.markdown(f"**Field:** `{field}`")
+                    m3.markdown(f"**Source system:** {src_sys}")
 
-    edited_queue = st.data_editor(
-        queue_display,
-        column_config=queue_col_cfg,
-        width="stretch",
-        hide_index=True,
-        num_rows="fixed",
-        key="health_queue_editor",
-    )
+                    if orig:
+                        st.markdown(f"**Original value:** `{orig}`")
+                    if sugg:
+                        st.markdown(f"**Suggested correction:** `{sugg}`")
+                    if detail:
+                        st.caption(detail)
 
-    # ── Persist resolved changes (DC only) ────────────────────────────────────
-    if is_dc:
-        # queue only shows unresolved flags, so any checkbox change is False -> True.
-        changed = ~(queue_orig["resolved"].eq(edited_queue["resolved"]))
-        if changed.any():
-            now_str = str(datetime.now(timezone.utc))
-            for i, row in edited_queue[changed].iterrows():
-                flag_id = row["flag_id"]
-                mask = dq_raw["flag_id"] == flag_id
-                dq_raw.loc[mask, "resolved"]    = True
-                dq_raw.loc[mask, "resolved_by"] = current_user
-                dq_raw.loc[mask, "resolved_at"] = now_str
-                log_edit(current_user, row["mdr_id"], f"dq_flag_resolved:{flag_id}", "False", "True")
-                _log("EDIT", f"DC {current_user} resolved flag {flag_id} on {row['mdr_id']}")
-            save_dq_flags(dq_raw)
-            st.toast(f"{changed.sum()} flag(s) marked as resolved.", icon="✅")
-            st.rerun()
+                    if is_dc:
+                        # Prompt for the corrected value or resolution note
+                        placeholder = (
+                            f"Enter corrected {field} value..." if ftype == "MISSING_MANDATORY_FIELD"
+                            else "Enter resolution note or confirmed correct value..."
+                        )
+                        resolution_val = st.text_input(
+                            "Resolution value / note",
+                            key=f"resolve_val_{flag_id}",
+                            placeholder=placeholder,
+                            help=(
+                                "For missing fields: enter the actual value (e.g. the author name). "
+                                "For normalisation issues: confirm the correct canonical value. "
+                                "For duplicates: describe which record was kept. "
+                                "This is recorded in the audit log."
+                            ),
+                        )
+                        if st.button("Confirm Resolved", key=f"btn_resolve_{flag_id}", type="primary"):
+                            if resolution_val.strip():
+                                now_str = str(datetime.now(timezone.utc))
+                                mask = dq_raw["flag_id"] == flag_id
+                                dq_raw.loc[mask, "resolved"]    = True
+                                dq_raw.loc[mask, "resolved_by"] = current_user
+                                dq_raw.loc[mask, "resolved_at"] = now_str
+                                # Log to audit trail: old value = original, new value = resolution
+                                log_edit(
+                                    current_user, mdr_id,
+                                    f"dq_flag_resolved:{flag_id}",
+                                    orig if orig else "MISSING",
+                                    resolution_val.strip(),
+                                )
+                                _log("EDIT", f"DC {current_user} resolved {flag_id} on {mdr_id} -> '{resolution_val.strip()}'")
+                                save_dq_flags(dq_raw)
+                                st.toast(f"{flag_id} marked as resolved.", icon="✅")
+                                st.rerun()
+                            else:
+                                st.warning("Enter a resolution value before confirming. In a real system this becomes the corrected field value in the source record.")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # TAB 2 — Pipeline Run Report (transformation log)
+    # ────────────────────────────────────────────────────────────────────────
+    with tab_report:
+        st.markdown('<div class="section-header">Pipeline Run Report — Automated Transformations</div>', unsafe_allow_html=True)
+
+        # Explanation of what this tab shows and why it matters
+        with st.expander("What is this?", expanded=False):
+            st.markdown("""
+**Automated transformations vs. DQ flags** — two distinct outcomes of the pipeline:
+
+| Outcome | Meaning | Who acts? |
+|---|---|---|
+| **DQ Flag** (Remediation Queue tab) | The pipeline detected a data quality issue it could not safely resolve — a missing mandatory field, a non-standard value it couldn't map with confidence, or a format it couldn't parse. **Human action required.** | Document Controller |
+| **Transformation** (this tab) | The pipeline applied a deterministic, rule-based conversion with HIGH confidence — date format normalisation, vocabulary mapping, revision format conversion. **No action required — for information only.** | Nobody (automated) |
+
+This distinction is the audit trail: every silent transformation is recorded here so nothing the pipeline does is invisible.
+            """)
+
+        if not TRANSFORMATION_LOG_CSV.exists():
+            st.warning(
+                "staged_transformation_log.csv not found. "
+                "Re-run data_generation/generate_staged_layer.py to generate it."
+            )
+        else:
+            _log("LOAD", f"Reading transformation log from {TRANSFORMATION_LOG_CSV}")
+            tx = pd.read_csv(TRANSFORMATION_LOG_CSV)
+            _log("LOAD", f"Transformation log loaded — {len(tx)} records")
+
+            # ── Summary metrics ───────────────────────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total transformations", len(tx))
+            m2.metric("Source systems", tx["source_system"].nunique())
+            m3.metric("Fields transformed", tx["field_name"].nunique())
+            m4.metric("Rules applied", tx["normalisation_rule"].nunique())
+
+            # ── Breakdown charts ──────────────────────────────────────────────
+            bc1, bc2 = st.columns(2)
+
+            with bc1:
+                st.markdown(
+                    '<div style="font-size:0.78rem; font-weight:600; color:#7a8499; '
+                    'margin:0.75rem 0 0.4rem 0;">Transformations by Rule</div>',
+                    unsafe_allow_html=True,
+                )
+                by_rule = (
+                    tx.groupby("normalisation_rule").size()
+                    .reset_index(name="count")
+                    .sort_values("count", ascending=False)
+                )
+                st.dataframe(
+                    by_rule,
+                    column_config={
+                        "normalisation_rule": st.column_config.TextColumn("Rule"),
+                        "count":              st.column_config.NumberColumn("Count", format="%d"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                )
+
+            with bc2:
+                st.markdown(
+                    '<div style="font-size:0.78rem; font-weight:600; color:#7a8499; '
+                    'margin:0.75rem 0 0.4rem 0;">Transformations by Source System</div>',
+                    unsafe_allow_html=True,
+                )
+                by_src = (
+                    tx.groupby("source_system").size()
+                    .reset_index(name="count")
+                    .sort_values("count", ascending=False)
+                )
+                st.dataframe(
+                    by_src,
+                    column_config={
+                        "source_system": st.column_config.TextColumn("Source"),
+                        "count":         st.column_config.NumberColumn("Count", format="%d"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                )
+
+            # ── Full transformation log with filters ──────────────────────────
+            st.markdown('<div class="section-header">Full Transformation Log</div>', unsafe_allow_html=True)
+
+            tf1, tf2, tf3 = st.columns([2, 3, 3])
+            tx_src_opts  = ["All"] + sorted(tx["source_system"].dropna().unique().tolist())
+            tx_rule_opts = ["All"] + sorted(tx["normalisation_rule"].dropna().unique().tolist())
+            tx_fld_opts  = ["All"] + sorted(tx["field_name"].dropna().unique().tolist())
+            sel_tx_src  = tf1.selectbox("Source system", tx_src_opts,  key="tx_src_filter")
+            sel_tx_rule = tf2.selectbox("Rule",          tx_rule_opts, key="tx_rule_filter")
+            sel_tx_fld  = tf3.selectbox("Field",         tx_fld_opts,  key="tx_fld_filter")
+
+            tx_view = tx.copy()
+            if sel_tx_src  != "All":
+                tx_view = tx_view[tx_view["source_system"] == sel_tx_src]
+            if sel_tx_rule != "All":
+                tx_view = tx_view[tx_view["normalisation_rule"] == sel_tx_rule]
+            if sel_tx_fld  != "All":
+                tx_view = tx_view[tx_view["field_name"] == sel_tx_fld]
+
+            _log("FILTER", f"Transform log — src={sel_tx_src} rule={sel_tx_rule} field={sel_tx_fld} -> {len(tx_view)} rows")
+
+            st.markdown(
+                f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
+                f'Showing <b>{len(tx_view)}</b> of {len(tx)} transformation records</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.dataframe(
+                tx_view.reset_index(drop=True),
+                column_config={
+                    "source_system":      st.column_config.TextColumn("Source",    width="small"),
+                    "source_native_id":   st.column_config.TextColumn("Source ID", width="small"),
+                    "mdr_id":             st.column_config.TextColumn("MDR ID"),
+                    "field_name":         st.column_config.TextColumn("Field",     width="small"),
+                    "original_value":     st.column_config.TextColumn("Original",  width="medium"),
+                    "normalised_value":   st.column_config.TextColumn("Normalised",width="medium"),
+                    "normalisation_rule": st.column_config.TextColumn("Rule"),
+                    "confidence":         st.column_config.TextColumn("Confidence",width="small"),
+                },
+                hide_index=True,
+                width="stretch",
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2215,6 +2522,41 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # Prevent Ctrl+C (Strg+C) from triggering Streamlit's built-in "Clear cache"
+    # keyboard shortcut. Streamlit's handler listens for the 'c' key and does not
+    # check whether Ctrl is held — so Ctrl+C trips it. We intercept in the capture
+    # phase (before Streamlit sees the event) and stop propagation only when Ctrl
+    # or Meta (Mac Cmd) is held. The browser's system-level copy action is separate
+    # from JS keyboard events and is unaffected — selected text still copies normally.
+    st.html("""
+    <script>
+    (function() {
+        /* 1 — Prevent Ctrl+C from triggering Streamlit's "Clear cache" shortcut.
+               Streamlit's handler fires on any 'c' keydown regardless of Ctrl.
+               We intercept in the capture phase and stop propagation only when
+               Ctrl or Meta is held; the browser's native copy action is unaffected. */
+        window.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+                e.stopPropagation();
+            }
+        }, true);
+
+        /* 2 — Restore sidebar if localStorage left it collapsed.
+               [data-testid="collapsedControl"] is the expand arrow that Streamlit
+               renders in the main content area when the sidebar is closed.
+               It only exists in the DOM when the sidebar IS collapsed, so clicking
+               it is a no-op when the sidebar is already open.
+               We try twice with a delay to handle Streamlit's async render timing. */
+        function tryExpand() {
+            var btn = window.parent.document.querySelector('[data-testid="collapsedControl"]');
+            if (btn) btn.click();
+        }
+        setTimeout(tryExpand, 300);
+        setTimeout(tryExpand, 900);
+    })();
+    </script>
+    """)
+
     # App header
     st.markdown("""
     <div class="app-header">
@@ -2223,8 +2565,13 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Load data
-    df = load_mdr()
+    # Working copy — lives in session state so in-session edits (e.g. priority changes
+    # that trigger RAG recomputation) survive reruns without hitting the CSV on every cycle.
+    # Cleared by the "Reset to pipeline state" button in the sidebar, which reloads
+    # fresh from CSV and recomputes RAG from the stored field values.
+    if "mdr_working" not in st.session_state:
+        st.session_state["mdr_working"] = load_mdr()
+    df = st.session_state["mdr_working"]
 
     # Sidebar — returns active user, selected saved view, and active role
     current_user, active_view, active_role = render_sidebar(df)

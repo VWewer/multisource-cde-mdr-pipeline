@@ -468,6 +468,77 @@ def make_dq_flag(
         "resolved_at":      "",
     }
 
+
+def make_transform_record(
+    source_system: str,
+    source_native_id: str,
+    mdr_id: str,
+    field_name: str,
+    original_value: str,
+    normalised_value: str,
+    normalisation_rule: str,
+    confidence: str = "HIGH",
+) -> dict | None:
+    """
+    Build one transformation log record, or return None if no change occurred.
+
+    The transformation log captures every silent, automated field mapping the
+    STAGED layer applies.  Unlike DQ flags (which need human action), these
+    transformations were applied with HIGH confidence and require no follow-up.
+    The distinction between 'automated' and 'auditable' is the interview talking
+    point: the pipeline makes its work visible even when no error was detected.
+
+    Args:
+        source_system:      Windchill / SharePoint / Aveva.
+        source_native_id:   Native ID of the document in the source system.
+        mdr_id:             ISO 19650 canonical ID assigned by this pipeline run.
+        field_name:         Canonical field name that was transformed.
+        original_value:     Raw value from the source system.
+        normalised_value:   Value after transformation.
+        normalisation_rule: Short code describing the rule applied (see constants below).
+        confidence:         HIGH = deterministic lookup, MEDIUM = fallback/inference.
+
+    Returns:
+        Dict for one row in staged_transformation_log.csv, or None if the
+        original and normalised values are identical (no transformation occurred).
+    """
+    # Only log when a real change happened — avoids noise from pass-through fields
+    if str(original_value) == str(normalised_value):
+        return None
+    return {
+        "source_system":      source_system,
+        "source_native_id":   source_native_id,
+        "mdr_id":             mdr_id,
+        "field_name":         field_name,
+        "original_value":     str(original_value),
+        "normalised_value":   str(normalised_value),
+        "normalisation_rule": normalisation_rule,
+        "confidence":         confidence,
+    }
+
+
+# Normalisation rule codes — used as the normalisation_rule value in the transform log.
+# Keep these short and consistent; they become filter values in the dashboard.
+RULE_DATE_DATETIME_TO_DATE  = "DATETIME_TO_DATE"       # ISO 8601 datetime -> date only (Windchill)
+RULE_DATE_MMDDYYYY          = "DATE_FORMAT_MMDDYYYY"   # MM/DD/YYYY -> YYYY-MM-DD (SharePoint)
+RULE_DATE_DDMMYYYY          = "DATE_FORMAT_DDMMYYYY"   # DD.MM.YYYY -> YYYY-MM-DD (Aveva)
+RULE_DISCIPLINE_CODE        = "DISCIPLINE_CODE_TO_NAME" # MECH/ELEC/INST/CIVIL -> canonical name
+RULE_DISCIPLINE_DEPT        = "DISCIPLINE_DEPT_TO_NAME" # SP department string -> canonical name
+RULE_DISCIPLINE_AVEVA       = "DISCIPLINE_AVEVA_TO_NAME"# Aveva discipline -> canonical name
+RULE_STATUS_VOCAB           = "STATUS_VOCABULARY"       # source status -> canonical status
+RULE_CONFIDENTIALITY_VOCAB  = "CONFIDENTIALITY_VOCABULARY" # source class -> canonical class
+RULE_REVISION_DECIMAL       = "REVISION_DECIMAL_TO_ALPHA"  # 1.0/2.0 -> A/B (SharePoint)
+RULE_REVISION_INTEGER       = "REVISION_INTEGER_TO_ALPHA"  # 0/1/2 -> A/B/C (Aveva)
+RULE_APPROVAL_TYPE          = "APPROVAL_TYPE_TO_CLASS"     # SP approval type -> class
+RULE_FILE_FORMAT_CASE       = "FILE_FORMAT_UPPERCASE"       # pdf -> PDF
+
+TRANSFORM_FIELDNAMES = [
+    "source_system", "source_native_id", "mdr_id",
+    "field_name", "original_value", "normalised_value",
+    "normalisation_rule", "confidence",
+]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -498,7 +569,7 @@ def add_days(d: date, n: int) -> date:
 # Windchill harmonisation
 # ---------------------------------------------------------------------------
 
-def harmonise_windchill(row: dict, dq_flags: list) -> dict:
+def harmonise_windchill(row: dict, dq_flags: list, transform_log: list) -> dict:
     """
     Map one Windchill source record to the canonical schema.
 
@@ -506,9 +577,16 @@ def harmonise_windchill(row: dict, dq_flags: list) -> dict:
       - Missing wc_author             -> MISSING_MANDATORY_FIELD
       - Non-standard wc_discipline_code (e.g. MECHANICAL) -> NORMALISATION_REQUIRED
 
+    Silent transformations logged to transform_log:
+      - Discipline code -> canonical name  (DISCIPLINE_CODE_TO_NAME)
+      - Lifecycle state -> canonical status (STATUS_VOCABULARY)
+      - ISO 8601 datetime -> date only      (DATETIME_TO_DATE)
+      - Confidentiality label -> canonical  (CONFIDENTIALITY_VOCABULARY)
+
     Args:
-        row:      One row from windchill_source.csv.
-        dq_flags: Mutable list to append DQ flag records to.
+        row:           One row from windchill_source.csv.
+        dq_flags:      Mutable list to append DQ flag records to.
+        transform_log: Mutable list to append transformation log records to.
 
     Returns:
         Canonical record dict (one row for raw_documents.csv).
@@ -528,6 +606,15 @@ def harmonise_windchill(row: dict, dq_flags: list) -> dict:
     iso19650_fn     = build_iso19650_filename(originator_code, type_code, role_code, seq, row["wc_revision"])
     doc_uuid        = stable_uuid(source_system, source_native_id)
     canonical_status = WC_STATUS_MAP.get(row["wc_lifecycle_state"], "IN_PROGRESS")
+
+    # -- Transformation log: discipline code and status vocabulary
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "discipline", raw_disc_code, discipline, RULE_DISCIPLINE_CODE)
+    if rec: transform_log.append(rec)
+
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "canonical_status", row["wc_lifecycle_state"], canonical_status, RULE_STATUS_VOCAB)
+    if rec: transform_log.append(rec)
 
     # -- DQ: non-standard discipline code
     if raw_disc_code not in WC_STANDARD_CODES:
@@ -560,12 +647,18 @@ def harmonise_windchill(row: dict, dq_flags: list) -> dict:
     # -- Revision: Windchill uses A/B/C — no normalisation needed
     revision = row["wc_revision"]
 
-    # -- Date: Windchill ISO 8601 — parse is straightforward
+    # -- Date: Windchill ISO 8601 datetime stripped to date only
     issue_date = parse_wc_date(row["wc_created_at"])
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "issue_date", row["wc_created_at"], issue_date, RULE_DATE_DATETIME_TO_DATE)
+    if rec: transform_log.append(rec)
 
     # -- Confidentiality
     confidentiality = WC_CONFIDENTIALITY_MAP.get(row["wc_confidentiality"], "INTERNAL")
     sensitive = confidentiality in ("RESTRICTED", "CONFIDENTIAL")
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "confidentiality_class", row["wc_confidentiality"], confidentiality, RULE_CONFIDENTIALITY_VOCAB)
+    if rec: transform_log.append(rec)
 
     return {
         # Identity
@@ -617,7 +710,7 @@ def harmonise_windchill(row: dict, dq_flags: list) -> dict:
 # SharePoint harmonisation
 # ---------------------------------------------------------------------------
 
-def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
+def harmonise_sharepoint(row: dict, dq_flags: list, transform_log: list) -> dict:
     """
     Map one SharePoint source record to the canonical schema.
 
@@ -627,9 +720,19 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
       - sp_department in SP_FLAG_DEPARTMENTS     -> NORMALISATION_REQUIRED
       - sp_version decimal format                -> REVISION_FORMAT_MISMATCH
 
+    Silent transformations logged to transform_log:
+      - Department string -> canonical discipline (DISCIPLINE_DEPT_TO_NAME)
+      - SP status -> canonical status             (STATUS_VOCABULARY)
+      - MM/DD/YYYY date -> ISO date               (DATE_FORMAT_MMDDYYYY)
+      - Classification -> canonical class         (CONFIDENTIALITY_VOCABULARY)
+      - Decimal version -> alpha revision         (REVISION_DECIMAL_TO_ALPHA)
+      - Approval type -> approval class           (APPROVAL_TYPE_TO_CLASS)
+      - File type -> uppercase                    (FILE_FORMAT_UPPERCASE)
+
     Args:
-        row:      One row from sharepoint_source.csv.
-        dq_flags: Mutable list to append DQ flag records to.
+        row:           One row from sharepoint_source.csv.
+        dq_flags:      Mutable list to append DQ flag records to.
+        transform_log: Mutable list to append transformation log records to.
 
     Returns:
         Canonical record dict.
@@ -654,6 +757,19 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
     doc_uuid    = stable_uuid(source_system, source_native_id)
 
     canonical_status = SP_STATUS_MAP.get(row["sp_status"], "IN_PROGRESS")
+
+    # -- Transformation log: discipline, status, revision
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "discipline", raw_dept, discipline, RULE_DISCIPLINE_DEPT)
+    if rec: transform_log.append(rec)
+
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "canonical_status", row["sp_status"], canonical_status, RULE_STATUS_VOCAB)
+    if rec: transform_log.append(rec)
+
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "revision", row["sp_version"], revision, RULE_REVISION_DECIMAL)
+    if rec: transform_log.append(rec)
 
     # -- DQ: department requires normalisation
     if raw_dept in SP_FLAG_DEPARTMENTS:
@@ -708,8 +824,12 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
             ),
         ))
 
-    # -- Date: parse MM/DD/YYYY
+    # -- Date: parse MM/DD/YYYY -> ISO date
     issue_date = parse_sp_date(row["sp_created"])
+    if issue_date:
+        rec = make_transform_record(source_system, source_native_id, mdr_id,
+            "issue_date", row["sp_created"], issue_date, RULE_DATE_MMDDYYYY)
+        if rec: transform_log.append(rec)
     if not issue_date:
         issue_date = TODAY.isoformat()
         dq_flags.append(make_dq_flag(
@@ -727,6 +847,9 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
     # -- Confidentiality
     confidentiality = SP_CONFIDENTIALITY_MAP.get(row["sp_classification"], "INTERNAL")
     sensitive = confidentiality in ("RESTRICTED", "CONFIDENTIAL")
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "confidentiality_class", row["sp_classification"], confidentiality, RULE_CONFIDENTIALITY_VOCAB)
+    if rec: transform_log.append(rec)
 
     # Map SharePoint approval type back to canonical approval class
     sp_to_canonical_approval = {
@@ -735,7 +858,18 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
         "Authority":     "AUTHORITY",
         "Certification": "CERTIFICATION",
     }
-    approval_class = sp_to_canonical_approval.get(row.get("sp_approval_type", "Internal"), "INTERNAL")
+    raw_approval_type = row.get("sp_approval_type", "Internal")
+    approval_class = sp_to_canonical_approval.get(raw_approval_type, "INTERNAL")
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "approval_class", raw_approval_type, approval_class, RULE_APPROVAL_TYPE)
+    if rec: transform_log.append(rec)
+
+    # File format: normalise to uppercase
+    raw_file_format = row.get("sp_file_type", "pdf")
+    file_format = raw_file_format.upper()
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "file_format", raw_file_format, file_format, RULE_FILE_FORMAT_CASE)
+    if rec: transform_log.append(rec)
 
     return {
         "document_id":            doc_uuid,
@@ -758,7 +892,7 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
         "revision":               revision,
         "title":                  row["sp_document_category"],
         "description":            f"{row['sp_document_category']} for {discipline} scope, version {row['sp_version']}.",
-        "file_format":            row.get("sp_file_type", "pdf").upper(),
+        "file_format":            file_format,
         "approval_class":         approval_class,
         "certification_required": row.get("sp_certification_required", False),
         "certifying_body":        row.get("sp_certifying_body", ""),
@@ -779,7 +913,7 @@ def harmonise_sharepoint(row: dict, dq_flags: list) -> dict:
 # Aveva harmonisation
 # ---------------------------------------------------------------------------
 
-def harmonise_aveva(row: dict, dq_flags: list) -> dict:
+def harmonise_aveva(row: dict, dq_flags: list, transform_log: list) -> dict:
     """
     Map one Aveva source record to the canonical schema.
 
@@ -791,9 +925,17 @@ def harmonise_aveva(row: dict, dq_flags: list) -> dict:
         (it parses correctly so no error flag, but the format difference is
         documented in CLAUDE.md as a design decision)
 
+    Silent transformations logged to transform_log:
+      - Aveva discipline -> canonical discipline (DISCIPLINE_AVEVA_TO_NAME)
+      - Aveva status -> canonical status         (STATUS_VOCABULARY)
+      - DD.MM.YYYY date -> ISO date              (DATE_FORMAT_DDMMYYYY)
+      - Security class -> canonical class        (CONFIDENTIALITY_VOCABULARY)
+      - Integer revision -> alpha revision       (REVISION_INTEGER_TO_ALPHA)
+
     Args:
-        row:      One row from aveva_source.csv.
-        dq_flags: Mutable list to append DQ flag records to.
+        row:           One row from aveva_source.csv.
+        dq_flags:      Mutable list to append DQ flag records to.
+        transform_log: Mutable list to append transformation log records to.
 
     Returns:
         Canonical record dict.
@@ -817,6 +959,19 @@ def harmonise_aveva(row: dict, dq_flags: list) -> dict:
     doc_uuid    = stable_uuid(source_system, source_native_id)
 
     canonical_status = AVEVA_STATUS_MAP.get(row["aveva_document_status"], "IN_PROGRESS")
+
+    # -- Transformation log: discipline, status, revision
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "discipline", raw_disc, discipline, RULE_DISCIPLINE_AVEVA)
+    if rec: transform_log.append(rec)
+
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "canonical_status", row["aveva_document_status"], canonical_status, RULE_STATUS_VOCAB)
+    if rec: transform_log.append(rec)
+
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "revision", str(row["aveva_revision_no"]), revision, RULE_REVISION_INTEGER)
+    if rec: transform_log.append(rec)
 
     # -- DQ: discipline requires normalisation
     if raw_disc in AVEVA_FLAG_DISCIPLINES:
@@ -859,8 +1014,12 @@ def harmonise_aveva(row: dict, dq_flags: list) -> dict:
             ),
         ))
 
-    # -- Date: parse DD.MM.YYYY
+    # -- Date: parse DD.MM.YYYY -> ISO date
     issue_date = parse_aveva_date(row["aveva_issue_date"])
+    if issue_date:
+        rec = make_transform_record(source_system, source_native_id, mdr_id,
+            "issue_date", row["aveva_issue_date"], issue_date, RULE_DATE_DDMMYYYY)
+        if rec: transform_log.append(rec)
     if not issue_date:
         issue_date = TODAY.isoformat()
         dq_flags.append(make_dq_flag(
@@ -879,6 +1038,9 @@ def harmonise_aveva(row: dict, dq_flags: list) -> dict:
     raw_security    = row.get("aveva_security_class", "Unrestricted")
     confidentiality = AVEVA_CONFIDENTIALITY_MAP.get(raw_security, "PUBLIC")
     sensitive       = confidentiality in ("RESTRICTED", "CONFIDENTIAL")
+    rec = make_transform_record(source_system, source_native_id, mdr_id,
+        "confidentiality_class", raw_security, confidentiality, RULE_CONFIDENTIALITY_VOCAB)
+    if rec: transform_log.append(rec)
 
     # Flag downgrade: "Highly Confidential" has no canonical equivalent
     if raw_security in AVEVA_DOWNGRADE_CONFIDENTIALITY:
@@ -1037,8 +1199,22 @@ def generate_document_events(doc: dict, project_start: date) -> list:
     """
     Generate the lifecycle event log for one canonically harmonised document.
 
-    Logic is identical to v1 staged layer — the only difference is that
-    the input is now a canonical record rather than a raw_documents row.
+    Planned dates are anchored to TODAY (the pipeline run date), NOT to the
+    document's issue_date.  This makes STAGED timeline dates consistent with
+    the MDR planned dates, which are now derived directly from these events.
+
+    Algorithm:
+      1. Build the full event sequence and cumulative day-gap offsets.
+      2. Choose target_completion (planned final approval) relative to TODAY:
+           - Terminal docs: randomly 7-365 days in the past (already done).
+           - Active docs: probabilistic RED/AMBER/GREEN zone draw,
+             constrained to days_to_completion <= remaining_duration so that
+             the current-status planned date is <= TODAY (enabling realistic
+             actual timestamps without impossible future-to-past capping).
+      3. plan_anchor = target_completion - total_duration  (work backwards).
+      4. planned_dates = plan_anchor + each cumulative gap.
+      5. actual_dates  = planned_date + variance, capped at TODAY,
+             for events up to actual_up_to; None beyond.
 
     Args:
         doc:           One canonical record from raw_documents.csv.
@@ -1050,16 +1226,6 @@ def generate_document_events(doc: dict, project_start: date) -> list:
     approval_class   = doc["approval_class"]
     canonical_status = doc["canonical_status"]
     document_id      = doc["document_id"]
-    issue_date_str   = doc["issue_date"]
-
-    try:
-        issue_date = date.fromisoformat(issue_date_str)
-    except Exception:
-        issue_date = TODAY - timedelta(days=180)
-
-    plan_anchor = add_days(issue_date, -random.randint(30, 90))
-    if plan_anchor < project_start:
-        plan_anchor = project_start
 
     has_revision_loop = random.random() < REVISION_PROBABILITY.get(approval_class, 0.20)
     sequence = build_planned_sequence(approval_class, has_revision_loop)
@@ -1070,18 +1236,59 @@ def generate_document_events(doc: dict, project_start: date) -> list:
     )
 
     interval_cfg = PLANNED_INTERVALS.get(approval_class, {"base": 14, "variance": 7})
-    planned_dates = [plan_anchor]
+
+    # Build cumulative gap offsets (days from plan_anchor to each event index).
+    # We compute them all upfront so we can derive plan_anchor from target_completion
+    # rather than plan_anchor from issue_date (the old approach).
+    cum_gaps = [0]
     for _ in range(1, len(sequence)):
-        gap = interval_cfg["base"] + random.randint(
+        step = interval_cfg["base"] + random.randint(
             -interval_cfg["variance"], interval_cfg["variance"]
         )
-        gap = max(gap, 3)
-        planned_dates.append(add_days(planned_dates[-1], gap))
+        cum_gaps.append(cum_gaps[-1] + max(step, 3))
+    total_duration = cum_gaps[-1]
 
+    # remaining_duration = days from the current status event to planned completion.
+    # This is the maximum valid positive float: if target_completion is set further
+    # than remaining_duration days from TODAY, the current-status planned date
+    # would be in the future, making the actual timestamp impossible.
+    remaining_duration = total_duration - cum_gaps[actual_up_to]
+    max_positive = max(remaining_duration, 1)
+
+    if canonical_status in TERMINAL_STATUSES:
+        # Document already approved — completion was some time in the past.
+        days_to_completion = -random.randint(7, 365)
+    else:
+        # Active document — distribute across RED / AMBER / GREEN.
+        # If not enough remaining steps to reach comfortable GREEN headroom,
+        # fall back to AMBER (late-stage docs are naturally tighter).
+        zone = random.choices(["RED", "AMBER", "GREEN"], weights=[0.25, 0.35, 0.40])[0]
+        if zone == "GREEN" and max_positive < 22:
+            zone = "AMBER"
+        if zone == "RED":
+            days_to_completion = random.randint(-90, -1)
+        elif zone == "AMBER":
+            days_to_completion = random.randint(0, max(1, min(21, max_positive)))
+        else:
+            days_to_completion = random.randint(22, max_positive)
+
+    target_completion = TODAY + timedelta(days=days_to_completion)
+
+    # Derive plan_anchor by working backwards from target_completion.
+    # plan_anchor is the date the PLANNED phase begins (before any authoring).
+    plan_anchor = target_completion - timedelta(days=total_duration)
+    if plan_anchor < project_start:
+        plan_anchor = project_start
+
+    # planned_dates: each event = plan_anchor + its cumulative gap
+    planned_dates = [plan_anchor + timedelta(days=g) for g in cum_gaps]
+
+    # actual_dates: add variance to planned date for events that have happened
+    # (up to actual_up_to); cap at TODAY so no actual is in the future.
     actual_dates = []
     for i in range(len(sequence)):
         if i <= actual_up_to:
-            actual_date = add_days(planned_dates[i], actual_variance(approval_class))
+            actual_date = planned_dates[i] + timedelta(days=actual_variance(approval_class))
             if actual_date > TODAY:
                 actual_date = TODAY
             actual_dates.append(actual_date)
@@ -1213,7 +1420,8 @@ def main():
 
     Reads windchill_source.csv, sharepoint_source.csv, aveva_source.csv.
     Writes raw_documents.csv, staged_events.csv,
-           staged_cross_reference.csv, staged_dq_flags.csv.
+           staged_cross_reference.csv, staged_dq_flags.csv,
+           staged_transformation_log.csv.
     """
     script_dir = Path(__file__).parent
 
@@ -1245,10 +1453,11 @@ def main():
     canonical_records = []
     xref_records      = []
     dq_flags          = []
+    transform_log     = []   # one record per field silently transformed by the pipeline
 
     _log("LOAD", "Harmonising Windchill records...")
     for row in wc_rows:
-        canon = harmonise_windchill(row, dq_flags)
+        canon = harmonise_windchill(row, dq_flags, transform_log)
         canonical_records.append(canon)
         xref_records.append(build_cross_reference(
             source_system    ="Windchill",
@@ -1261,7 +1470,7 @@ def main():
 
     _log("LOAD", "Harmonising SharePoint records...")
     for row in sp_rows:
-        canon = harmonise_sharepoint(row, dq_flags)
+        canon = harmonise_sharepoint(row, dq_flags, transform_log)
         canonical_records.append(canon)
         xref_records.append(build_cross_reference(
             source_system    ="SharePoint",
@@ -1274,7 +1483,7 @@ def main():
 
     _log("LOAD", "Harmonising Aveva records...")
     for row in av_rows:
-        canon = harmonise_aveva(row, dq_flags)
+        canon = harmonise_aveva(row, dq_flags, transform_log)
         canonical_records.append(canon)
         xref_records.append(build_cross_reference(
             source_system    ="Aveva",
@@ -1285,7 +1494,10 @@ def main():
             document_id      = canon["document_id"],
         ))
 
-    _log("LOAD", f"Harmonisation complete: {len(canonical_records)} canonical records, {len(dq_flags)} DQ flags")
+    _log("LOAD", (
+        f"Harmonisation complete: {len(canonical_records)} canonical records, "
+        f"{len(dq_flags)} DQ flags, {len(transform_log)} transformations logged"
+    ))
 
     # -- Generate events from harmonised records
     _log("LOAD", "Generating lifecycle events...")
@@ -1297,15 +1509,16 @@ def main():
     _log("LOAD", f"Event generation complete: {len(all_events)} events")
 
     # -- Write all outputs
-    write_csv(canonical_records, script_dir / "raw_documents.csv",          RAW_FIELDNAMES,   "harmonised records")
-    write_csv(all_events,        script_dir / "staged_events.csv",          EVENT_FIELDNAMES, "events")
-    write_csv(xref_records,      script_dir / "staged_cross_reference.csv", XREF_FIELDNAMES,  "cross-reference rows")
-    write_csv(dq_flags,          script_dir / "staged_dq_flags.csv",        DQ_FIELDNAMES,    "DQ flags")
+    write_csv(canonical_records, script_dir / "raw_documents.csv",                RAW_FIELDNAMES,       "harmonised records")
+    write_csv(all_events,        script_dir / "staged_events.csv",                EVENT_FIELDNAMES,     "events")
+    write_csv(xref_records,      script_dir / "staged_cross_reference.csv",       XREF_FIELDNAMES,      "cross-reference rows")
+    write_csv(dq_flags,          script_dir / "staged_dq_flags.csv",              DQ_FIELDNAMES,        "DQ flags")
+    write_csv(transform_log,     script_dir / "staged_transformation_log.csv",    TRANSFORM_FIELDNAMES, "transformation records")
 
-    print_summary(canonical_records, all_events, dq_flags)
+    print_summary(canonical_records, all_events, dq_flags, transform_log)
 
 
-def print_summary(records: list, events: list, dq_flags: list) -> None:
+def print_summary(records: list, events: list, dq_flags: list, transform_log: list) -> None:
     """Print a plain-text summary of all pipeline outputs."""
     from collections import Counter
 
@@ -1313,6 +1526,7 @@ def print_summary(records: list, events: list, dq_flags: list) -> None:
     print(f"Harmonised records : {len(records)}")
     print(f"Events generated   : {len(events)}")
     print(f"DQ flags raised    : {len(dq_flags)}")
+    print(f"Transformations    : {len(transform_log)}")
 
     print("\nRecords by source system:")
     src_counts = Counter(r["source_system"] for r in records)
@@ -1338,6 +1552,17 @@ def print_summary(records: list, events: list, dq_flags: list) -> None:
     print(f"\nEvents breakdown:")
     print(f"  Completed (actual timestamp) : {actual_count}")
     print(f"  Planned (future)             : {len(events) - actual_count}")
+
+    print("\nTransformations by rule:")
+    rule_counts = Counter(t["normalisation_rule"] for t in transform_log)
+    for k, v in sorted(rule_counts.items(), key=lambda x: -x[1]):
+        print(f"  {k:<35} {v:>3}")
+
+    print("\nTransformations by source system:")
+    src_tx_counts = Counter(t["source_system"] for t in transform_log)
+    for k, v in sorted(src_tx_counts.items(), key=lambda x: -x[1]):
+        print(f"  {k:<20} {v:>3}")
+
     print("-" * 53)
 
 

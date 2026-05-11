@@ -32,8 +32,8 @@ fake = Faker()
 random.seed(7)
 Faker.seed(7)
 
-TODAY = date(2026, 5, 8)
-LAST_MONTH = date(2026, 4, 8)   # previous snapshot date
+TODAY      = date(2026, 5, 10)   # pipeline run date — must match generate_staged_layer.py
+LAST_MONTH = date(2026, 4, 10)  # previous snapshot date (one month prior)
 
 # ── Priority (Very High replaces Critical to avoid confusion with critical path) ─
 PRIORITY_WEIGHTS = {
@@ -49,7 +49,7 @@ def assign_priority(approval_class: str) -> str:
     weights = PRIORITY_WEIGHTS[approval_class]
     return random.choices(list(weights.keys()), weights=list(weights.values()), k=1)[0]
 
-# ── RAG status — driven by float × priority ────────────────────────────────────
+# ── RAG status — driven by float × priority (+ critical path tier) ────────────
 RAG_THRESHOLDS = {
     #                AMBER  RED
     "Very High": (21,       7),
@@ -58,47 +58,96 @@ RAG_THRESHOLDS = {
     "Low":       ( 7,    -180),   # Low: never RED unless very significantly overdue
 }
 
-def derive_rag(float_days: int, priority: str, canonical_status: str) -> str:
+# Option B: dedicated critical-path tier, regardless of priority label.
+# Critical path documents are held to tighter thresholds because any slip
+# cascades directly to the project completion date.
+CRITICAL_PATH_THRESHOLDS = (14, 3)  # (AMBER <= 14d, RED <= 3d)
+
+# Statuses that mean the document lifecycle is complete — no schedule risk.
+TERMINAL_STATUSES = {
+    "APPROVED_FINAL", "APPROVED_CUSTOMER", "APPROVED_AUTHORITY",
+    "APPROVED_CERTIFICATION", "SUPERSEDED",
+}
+
+def derive_rag(float_days: int, priority: str, canonical_status: str,
+               is_on_critical_path: bool = False) -> str:
+    """Compute RAG status from schedule float, priority, lifecycle status, and critical path flag.
+
+    Args:
+        float_days:          (planned_approval_date - TODAY).days — negative means overdue.
+        priority:            One of Very High / High / Medium / Low.
+        canonical_status:    Current lifecycle status (e.g. SUBMITTED, APPROVED_FINAL).
+        is_on_critical_path: If True, apply the dedicated Critical Path threshold tier
+                             (AMBER <= 14d, RED <= 3d) regardless of priority.
+
+    Returns:
+        "RED", "AMBER", or "GREEN".
+    """
+    # Completed documents carry no schedule risk regardless of float arithmetic.
+    if canonical_status in TERMINAL_STATUSES:
+        return "GREEN"
     if canonical_status == "OVERDUE":
         return "RED"
-    amber_thresh, red_thresh = RAG_THRESHOLDS[priority]
+    # Critical path overrides priority thresholds — any slip on a critical path
+    # document cascades to the project end date, so we apply the tightest tier.
+    if is_on_critical_path:
+        amber_thresh, red_thresh = CRITICAL_PATH_THRESHOLDS
+    else:
+        amber_thresh, red_thresh = RAG_THRESHOLDS[priority]
     if float_days <= red_thresh:
         return "RED"
     if float_days <= amber_thresh:
         return "AMBER"
     return "GREEN"
 
-# ── Date generation ────────────────────────────────────────────────────────────
-def generate_planned_dates(priority: str, approval_class: str) -> tuple:
-    """Returns (planned_submission_date, planned_approval_date)."""
-    review_durations = {
-        "INTERNAL":      random.randint(7,  21),
-        "CUSTOMER":      random.randint(14, 42),
-        "AUTHORITY":     random.randint(28, 90),
-        "CERTIFICATION": random.randint(21, 60),
-    }
-    review_duration = review_durations[approval_class]
+# ── Planned dates — derived from STAGED events ─────────────────────────────────
+# generate_planned_dates() was removed in v4. Planned dates are no longer
+# generated independently here.  They are read from staged_events.csv so that
+# the MDR "Planned Approval" date matches the last planned event in the STAGED
+# lifecycle timeline, making Document Detail coherent.
 
-    float_target = random.choices(
-        ["RED", "AMBER", "GREEN"], weights=[0.25, 0.35, 0.40], k=1
-    )[0]
+def build_staged_planned_dates(staged_events: list) -> dict:
+    """
+    Build a per-document lookup of planned submission and approval dates from
+    the STAGED event schedule.
 
-    amber_thresh, red_thresh = RAG_THRESHOLDS[priority]
+    The planned_approval_date is the planned_timestamp of the last event in the
+    sequence (the terminal approval step).  The planned_submission_date is the
+    planned_timestamp of the first SUBMITTED event (the initial submission milestone).
 
-    if float_target == "RED":
-        lo = max(red_thresh - 60, -180)
-        hi = max(lo, red_thresh)
-        float_days = random.randint(lo, hi)
-    elif float_target == "AMBER":
-        lo = red_thresh + 1
-        hi = max(lo, amber_thresh)
-        float_days = random.randint(lo, hi)
-    else:
-        float_days = random.randint(amber_thresh + 1, amber_thresh + 60)
+    Args:
+        staged_events: List of event dicts from staged_events.csv.
 
-    planned_approval_date   = TODAY + timedelta(days=float_days)
-    planned_submission_date = planned_approval_date - timedelta(days=review_duration)
-    return planned_submission_date, planned_approval_date
+    Returns:
+        Dict mapping document_id -> {planned_approval_date, planned_submission_date}
+        as date objects.
+    """
+    # Group events by document
+    by_doc = defaultdict(list)
+    for e in staged_events:
+        by_doc[e["document_id"]].append(e)
+
+    lookup = {}
+    for doc_id, events in by_doc.items():
+        # Last planned event = planned approval (sort by planned_timestamp string;
+        # ISO 8601 sorts lexicographically so string sort == date sort)
+        sorted_events = sorted(events, key=lambda e: e["planned_timestamp"])
+        planned_approval = date.fromisoformat(sorted_events[-1]["planned_timestamp"][:10])
+
+        # First SUBMITTED event = planned submission milestone
+        submitted = [e for e in events if e["to_status"] == "SUBMITTED"]
+        if submitted:
+            first_sub = sorted(submitted, key=lambda e: e["planned_timestamp"])[0]
+            planned_submission = date.fromisoformat(first_sub["planned_timestamp"][:10])
+        else:
+            # Fallback: approval minus a sensible review window
+            planned_submission = planned_approval - timedelta(days=14)
+
+        lookup[doc_id] = {
+            "planned_approval_date":   planned_approval,
+            "planned_submission_date": planned_submission,
+        }
+    return lookup
 
 # ── Date trending ──────────────────────────────────────────────────────────────
 def generate_date_trend(planned_approval_date: date) -> tuple:
@@ -300,7 +349,7 @@ def main():
 
     for p in [raw_path, staged_path]:
         if not p.exists():
-            print(f"✗ Cannot find {p}. Run previous generation scripts first.")
+            print(f"ERROR: Cannot find {p}. Run previous generation scripts first.")
             return
 
     with open(raw_path, encoding="utf-8") as f:
@@ -314,6 +363,11 @@ def main():
     staged_by_doc = defaultdict(list)
     for e in staged_events:
         staged_by_doc[e["document_id"]].append(e)
+
+    # Build planned-date lookup from STAGED events (replaces generate_planned_dates).
+    # planned_approval_date  = last event's planned_timestamp
+    # planned_submission_date = first SUBMITTED event's planned_timestamp
+    staged_planned = build_staged_planned_dates(staged_events)
 
     mdr_records = []
 
@@ -329,17 +383,14 @@ def main():
         mdr_id   = doc["mdr_id"]
         priority = assign_priority(approval_class)
 
-        planned_submission_date, planned_approval_date = generate_planned_dates(
-            priority, approval_class
-        )
-
-        schedule_float_days = (planned_approval_date - TODAY).days
-        rag_status = derive_rag(schedule_float_days, priority, canonical_status)
-
-        responsible_person, responsible_company = assign_responsible(discipline, approval_class)
+        # Planned dates come from the STAGED event schedule — not independently generated.
+        dates = staged_planned.get(document_id, {})
+        planned_approval_date   = dates.get("planned_approval_date",   TODAY)
+        planned_submission_date = dates.get("planned_submission_date", TODAY - timedelta(days=14))
 
         # Critical path: realistic ~20% of total register
-        # AUTHORITY/CERTIFICATION and Very High/High priority skew higher
+        # AUTHORITY/CERTIFICATION and Very High/High priority skew higher.
+        # Assigned before derive_rag() so the critical-path tier can be applied.
         cp_base = {
             "AUTHORITY":     0.45,
             "CERTIFICATION": 0.35,
@@ -348,6 +399,11 @@ def main():
         }[approval_class]
         priority_boost = {"Very High": 0.10, "High": 0.05, "Medium": 0.0, "Low": -0.05}[priority]
         is_on_critical_path = random.random() < min(cp_base + priority_boost, 0.90)
+
+        schedule_float_days = (planned_approval_date - TODAY).days
+        rag_status = derive_rag(schedule_float_days, priority, canonical_status, is_on_critical_path)
+
+        responsible_person, responsible_company = assign_responsible(discipline, approval_class)
 
         # Date trending
         (baseline_approval_date, previous_approval_date,
@@ -419,7 +475,7 @@ def main():
         writer.writeheader()
         writer.writerows(mdr_records)
 
-    print(f"OK: Written {len(mdr_records)} MDR rows -> {output_path}")
+    print(f"[SAVE] Written {len(mdr_records)} MDR rows -> {output_path.name}")
     print_summary(mdr_records)
 
 
