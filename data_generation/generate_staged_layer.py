@@ -514,6 +514,8 @@ def make_transform_record(
         "normalised_value":   str(normalised_value),
         "normalisation_rule": normalisation_rule,
         "confidence":         confidence,
+        # run_timestamp is set later in main() so all records share the same stamp
+        "run_timestamp":      "",
     }
 
 
@@ -535,7 +537,7 @@ RULE_FILE_FORMAT_CASE       = "FILE_FORMAT_UPPERCASE"       # pdf -> PDF
 TRANSFORM_FIELDNAMES = [
     "source_system", "source_native_id", "mdr_id",
     "field_name", "original_value", "normalised_value",
-    "normalisation_rule", "confidence",
+    "normalisation_rule", "confidence", "run_timestamp",
 ]
 
 
@@ -608,8 +610,13 @@ def harmonise_windchill(row: dict, dq_flags: list, transform_log: list) -> dict:
     canonical_status = WC_STATUS_MAP.get(row["wc_lifecycle_state"], "IN_PROGRESS")
 
     # -- Transformation log: discipline code and status vocabulary
+    # Confidence = MEDIUM for non-standard codes (e.g. "MECHANICAL" instead of "MECH").
+    # The pipeline can still map them via the extended lookup table, but the mapping
+    # is not a standard abbreviation — it needs human sign-off, so a DQ flag is raised.
+    # HIGH = unambiguous standard code; MEDIUM = plausible guess requiring confirmation.
+    disc_confidence = "HIGH" if raw_disc_code in WC_STANDARD_CODES else "MEDIUM"
     rec = make_transform_record(source_system, source_native_id, mdr_id,
-        "discipline", raw_disc_code, discipline, RULE_DISCIPLINE_CODE)
+        "discipline", raw_disc_code, discipline, RULE_DISCIPLINE_CODE, disc_confidence)
     if rec: transform_log.append(rec)
 
     rec = make_transform_record(source_system, source_native_id, mdr_id,
@@ -625,7 +632,7 @@ def harmonise_windchill(row: dict, dq_flags: list, transform_log: list) -> dict:
             flag_detail=(
                 f"wc_discipline_code '{raw_disc_code}' is not a standard Windchill code. "
                 f"Expected one of: MECH, ELEC, INST, CIVIL. "
-                f"Mapped to '{discipline}' — please confirm."
+                f"Mapped to '{discipline}' with MEDIUM confidence — please confirm."
             ),
             original_value=raw_disc_code,
             suggested_value=discipline,
@@ -961,8 +968,11 @@ def harmonise_aveva(row: dict, dq_flags: list, transform_log: list) -> dict:
     canonical_status = AVEVA_STATUS_MAP.get(row["aveva_document_status"], "IN_PROGRESS")
 
     # -- Transformation log: discipline, status, revision
+    # Aveva uses vendor-specific notation ("I&C") that doesn't match canonical names.
+    # These are MEDIUM confidence — the mapping is well-understood but not a 1:1 code.
+    disc_confidence = "MEDIUM" if raw_disc in AVEVA_FLAG_DISCIPLINES else "HIGH"
     rec = make_transform_record(source_system, source_native_id, mdr_id,
-        "discipline", raw_disc, discipline, RULE_DISCIPLINE_AVEVA)
+        "discipline", raw_disc, discipline, RULE_DISCIPLINE_AVEVA, disc_confidence)
     if rec: transform_log.append(rec)
 
     rec = make_transform_record(source_system, source_native_id, mdr_id,
@@ -981,7 +991,7 @@ def harmonise_aveva(row: dict, dq_flags: list, transform_log: list) -> dict:
             flag_type="NORMALISATION_REQUIRED",
             flag_detail=(
                 f"aveva_discipline '{raw_disc}' does not match canonical discipline vocabulary. "
-                f"Mapped to '{discipline}' via lookup table — please confirm."
+                f"Mapped to '{discipline}' with MEDIUM confidence — please confirm."
             ),
             original_value=raw_disc,
             suggested_value=discipline,
@@ -1507,6 +1517,12 @@ def main():
         all_events.extend(generate_document_events(doc, project_start))
 
     _log("LOAD", f"Event generation complete: {len(all_events)} events")
+
+    # Stamp every transformation record with the pipeline run time before writing.
+    # All records get the same timestamp so you can filter to "this run" in the dashboard.
+    _run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    for _t in transform_log:
+        _t["run_timestamp"] = _run_ts
 
     # -- Write all outputs
     write_csv(canonical_records, script_dir / "raw_documents.csv",                RAW_FIELDNAMES,       "harmonised records")

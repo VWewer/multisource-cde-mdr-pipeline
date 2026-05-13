@@ -530,6 +530,14 @@ def load_mdr() -> pd.DataFrame:
             return val
         return str(val).lower() == "true"
 
+    # pandas 3.0 reads string columns as StringDtype (PyArrow-backed) when pyarrow is
+    # installed.  Streamlit's data_editor cannot render PyArrow-backed strings and shows
+    # 0 rows silently.  Convert ALL string columns to plain object dtype immediately after
+    # reading so every downstream operation — filtering, display, edits — works as expected.
+    str_cols = df.select_dtypes(include="string").columns.tolist()
+    if str_cols:
+        df[str_cols] = df[str_cols].astype(object)
+
     df["rag_status"] = df.apply(
         lambda row: derive_rag(
             int(row["schedule_float_days"]) if pd.notna(row.get("schedule_float_days")) else 0,
@@ -877,6 +885,44 @@ def rag_badge(rag: str) -> str:
     return f'<span class="badge {cls}">{rag}</span>'
 
 
+def render_rag_threshold_expander(key_suffix: str = ""):
+    """Render a collapsible RAG threshold reference table.
+
+    Shows the exact day-count thresholds used to assign RED / AMBER / GREEN
+    per priority tier, including the critical-path override rule.  Calling this
+    on both Overview and MDR gives users the decision logic wherever they are.
+
+    Args:
+        key_suffix: Unique string appended to the expander key to avoid
+                    Streamlit key collisions when the same expander appears
+                    on multiple pages in the same run.
+    """
+    with st.expander("RAG thresholds — how status is calculated", expanded=False):
+        st.markdown("""
+**RAG status** is derived live from schedule float and document priority.
+Float = `planned_approval_date − today (demo date: 2026-05-08)`. Negative float = already past the planned date.
+
+**Step 1 — pick the threshold tier:**
+Documents on the critical path use a single flat **Critical Path tier** regardless of priority.
+Off-critical-path documents use their **Priority tier**.
+
+| Tier | Applies to | AMBER when float ≤ | RED when float ≤ |
+|---|---|---:|---:|
+| **Critical Path** | `is_on_critical_path = True` (any priority) | **14 days** | **3 days** |
+| Very High | Critical path = No | 21 days | 7 days |
+| High | Critical path = No | 14 days | 3 days |
+| Medium | Critical path = No | 7 days | 0 days |
+| Low | Critical path = No | 7 days | −180 days |
+
+**Note:** "Very High + Critical Path" is actually *looser* than "Very High alone" because the flat CP tier (14d/3d) is tighter than Very High off-CP (21d/7d). That is intentional — the CP override exists to surface scheduling risk regardless of how a document was originally prioritised.
+
+**Step 2 — terminal status override:**
+Documents with a terminal status (APPROVED_FINAL, APPROVED_CUSTOMER, APPROVED_AUTHORITY, APPROVED_CERTIFICATION, SUPERSEDED) are forced to **GREEN** regardless of dates.
+
+**Example:** Priority=Very High, not on critical path, float=+10d → AMBER (≤21d). Add it to critical path → RED (≤14d CP threshold, but float=10d > 3d, so AMBER by CP tier).
+        """)
+
+
 def gk_bar_color(count: int, max_count: int) -> str:
     ratio = count / max_count if max_count else 0
     if ratio > 0.6:
@@ -995,7 +1041,7 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
         st.markdown('<div class="sidebar-section">Navigation</div>', unsafe_allow_html=True)
         page = st.radio(
             "Page",
-            ["Overview", "MDR", "My Watchlist", "Document Detail", "Source System Health"],
+            ["Overview", "MDR", "My Watchlist", "Document Detail", "Source System Health", "Audit Trail"],
             label_visibility="collapsed",
             key="nav_page",
             help="Switch between dashboard pages.",
@@ -1075,13 +1121,91 @@ def render_sidebar(df: pd.DataFrame) -> tuple[str, str | None, str]:
         )
 
         st.divider()
-        if st.button("Reset to pipeline state", width="stretch",
-                     help="Discard in-session edits and reload from the pipeline CSV. "
-                          "Saved changes (notes, % complete) are preserved on disk."):
-            # Drop the working copy — next render re-reads CSV and recomputes RAG fresh.
+
+        # ── Demo / pipeline controls ──────────────────────────────────────────
+        st.markdown('<div class="sidebar-section">Demo Controls</div>', unsafe_allow_html=True)
+
+        # 1. Reload from disk — clears Streamlit cache so next render reads fresh CSVs.
+        #    Use this after running the pipeline scripts manually from the terminal.
+        #    Does NOT change any data on disk.
+        if st.button(
+            "Reload from disk",
+            width="stretch",
+            key="btn_reload_disk",
+            help=(
+                "Clears the Streamlit data cache so all CSVs are re-read from disk on "
+                "the next render. Use this after running generate_staged_layer.py or "
+                "generate_mdr_layer.py from the terminal. No data is changed."
+            ),
+        ):
+            st.cache_data.clear()
+            st.session_state.pop("mdr_working", None)
+            _log("LOAD", "Cache cleared — reloading all CSVs from disk on next render")
+            st.rerun()
+
+        # 2. Reset to pipeline state — clears in-memory edits, reloads from disk.
+        #    MDR CSV edits (priority, critical path, notes) made through the dashboard
+        #    are written to disk — this button reloads from disk without changing them.
+        if st.button(
+            "Reset to pipeline state",
+            width="stretch",
+            key="btn_reset_pipeline",
+            help=(
+                "Discards any unsaved in-session edits and reloads from the pipeline "
+                "CSV files on disk. Dashboard edits already saved (priority, % complete, "
+                "notes, is_on_critical_path) are preserved on disk — they are NOT reverted."
+            ),
+        ):
             st.session_state.pop("mdr_working", None)
             st.cache_data.clear()
             st.rerun()
+
+        # 3. Full demo reset — re-runs the entire pipeline from staged → MDR layer,
+        #    clears the complete edit log, and reloads. Use before each demo to get a
+        #    perfectly clean state: all DQ flags unresolved, no PM edits, fresh RAG.
+        if st.button(
+            "Full demo reset",
+            width="stretch",
+            key="btn_full_reset",
+            type="secondary",
+            help=(
+                "Re-runs generate_staged_layer.py and generate_mdr_layer.py, then "
+                "clears the entire edit log (DQ resolutions AND PM edits). "
+                "Use this before a demo to restore every flag and undo all edits. "
+                "DISCARDS all DC resolutions, priority changes, and is_on_critical_path "
+                "changes made through the dashboard."
+            ),
+        ):
+            import subprocess
+            import sys as _sys
+            _staged_script = DATA_DIR / "generate_staged_layer.py"
+            _mdr_script    = DATA_DIR / "generate_mdr_layer.py"
+            _log("EDIT", "Full demo reset: re-running staged and MDR pipeline scripts")
+            with st.spinner("Running full pipeline reset..."):
+                _r1 = subprocess.run(
+                    [_sys.executable, str(_staged_script)],
+                    cwd=str(DATA_DIR), capture_output=True, text=True, timeout=120,
+                )
+                _r2 = subprocess.run(
+                    [_sys.executable, str(_mdr_script)],
+                    cwd=str(DATA_DIR), capture_output=True, text=True, timeout=120,
+                ) if _r1.returncode == 0 else None
+            if _r1.returncode != 0:
+                st.error(f"generate_staged_layer.py failed:\n{_r1.stderr[:300]}")
+            elif _r2 and _r2.returncode != 0:
+                st.error(f"generate_mdr_layer.py failed:\n{_r2.stderr[:300]}")
+            else:
+                # Wipe the entire edit log so the dashboard starts completely clean.
+                # Both DQ_REMEDIATION and PM_UPDATE events are cleared because the
+                # regenerated MDR CSV has fresh baseline values — old edits no longer
+                # correspond to the new data.
+                if EDIT_LOG_CSV.exists():
+                    pd.DataFrame(columns=["timestamp","username","mdr_id","field","old_value","new_value"]
+                                 ).to_csv(EDIT_LOG_CSV, index=False)
+                    _log("SAVE", "Full demo reset: edit_log.csv cleared")
+                st.session_state.pop("mdr_working", None)
+                st.cache_data.clear()
+                st.rerun()
 
         st.markdown(
             f'<div style="font-size:0.65rem; color:#4a5568; margin-top:0.5rem; font-family:\'IBM Plex Mono\',monospace;">'
@@ -1209,6 +1333,10 @@ Controls what you can edit in this session:
             st.session_state["reg_disc"]   = disc_val
         if person_val:
             st.session_state["reg_person"] = person_val
+        # Signal to page_mdr_register that explicit filter values were just set here.
+        # The _reg_view reset block will skip its saved-view override so these values
+        # are not overwritten when active_view happens to differ from _reg_view.
+        st.session_state["_nav_filters_set"] = True
         st.session_state["_nav_request"] = "MDR"
         st.rerun()
 
@@ -1228,13 +1356,14 @@ Controls what you can edit in this session:
 
     # ── RAG legend ────────────────────────────────────────────────────────────
     st.markdown(
-        '<div style="font-size:0.68rem; color:#4a5568; margin-top:0.2rem; margin-bottom:0.5rem;">'
+        '<div style="font-size:0.68rem; color:#4a5568; margin-top:0.2rem; margin-bottom:0.25rem;">'
         '<b style="color:#ef4444;">RED</b> = at or past the deadline warning threshold for this priority &nbsp;|&nbsp; '
         '<b style="color:#f59e0b;">AMBER</b> = within warning window (Very High: &le;21d, High: &le;14d, Medium: &le;7d) &nbsp;|&nbsp; '
         '<b style="color:#22c55e;">GREEN</b> = on track'
         '</div>',
         unsafe_allow_html=True
     )
+    render_rag_threshold_expander("overview")
 
     # ── Date Trend Summary ─────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Date Trend</div>', unsafe_allow_html=True)
@@ -1552,11 +1681,15 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     v_cols    = view_data.get("columns", [])
     v_sort    = view_data.get("sort", {})
 
-    # Reset filter widget state when the active view changes so new defaults apply
-    if st.session_state.get("_reg_view") != active_view:
-        st.session_state["_reg_view"] = active_view
+    # Reset filter widget state when the active view changes so new defaults apply.
+    # Exception: if _nav_to_register just set explicit filter values, skip the reset so
+    # navigation-driven filters (e.g. "View 12 RED ->") are not overwritten by the saved
+    # view's defaults.  Always update _reg_view so the check stays accurate next render.
+    nav_just_set_filters = st.session_state.pop("_nav_filters_set", False)
+    if st.session_state.get("_reg_view") != active_view and not nav_just_set_filters:
         for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr", "reg_trend", "reg_person", "reg_search", "reg_cols"):
             st.session_state.pop(k, None)
+    st.session_state["_reg_view"] = active_view
 
     # ── Filters ───────────────────────────────────────────────────────────────
     with st.expander("Filters", expanded=True):
@@ -1590,7 +1723,7 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
             "Search",
             placeholder="Filter by document ID, title, responsible person, or discipline...",
             key="reg_search",
-            label_visibility="collapsed",
+            label_visibility="visible",
             help=(
                 "Case-insensitive partial match across MDR ID, document title, "
                 "responsible person, and discipline. Works alongside the dropdown filters."
@@ -1623,6 +1756,8 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
         f"cp={sel_cp} | appr={sel_appr} | trend={sel_trend} | person={sel_person} "
         f"| search='{search_query}' -> {len(filt)} of {len(df)} rows"
     ))
+
+    render_rag_threshold_expander("mdr")
 
     # ── Column selector ───────────────────────────────────────────────────────
     # Only Project Managers can write PM_UPDATE events (priority, critical path,
@@ -1677,11 +1812,40 @@ def page_mdr_register(df: pd.DataFrame, current_user: str, active_view: str | No
     else:
         display_df["view_source"] = False
 
-    st.markdown(
-        f'<div style="font-size:0.75rem;color:#7a8499;margin:0.25rem 0 0.5rem 0;">'
-        f'Showing <b>{len(display_df)}</b> of {len(df)} documents</div>',
-        unsafe_allow_html=True,
-    )
+    # ── Active-filter summary + clear button ─────────────────────────────────
+    active_filters = {
+        k: v for k, v in {
+            "Discipline": sel_disc, "RAG": sel_rag, "Priority": sel_prio,
+            "Critical Path": sel_cp, "Approval": sel_appr,
+            "Trend": sel_trend, "Person": sel_person,
+            "Search": search_query.strip() or None,
+        }.items() if v and v not in ("All", None, "")
+    }
+    filter_row_left, filter_row_right = st.columns([7, 1])
+    with filter_row_left:
+        if active_filters:
+            tags = "  ".join(
+                f'<span style="background:#252d40;border:1px solid #3b82f6;border-radius:3px;'
+                f'padding:0.1rem 0.45rem;font-size:0.72rem;color:#93c5fd;">'
+                f'{k}: {v}</span>'
+                for k, v in active_filters.items()
+            )
+            st.markdown(
+                f'<div style="margin:0.1rem 0 0.4rem 0;">Filters active: {tags}</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            f'<div style="font-size:0.75rem;color:#7a8499;margin:0.1rem 0 0.4rem 0;">'
+            f'Showing <b>{len(display_df)}</b> of {len(df)} documents</div>',
+            unsafe_allow_html=True,
+        )
+    with filter_row_right:
+        if active_filters and st.button("Clear filters", key="mdr_clear_filters"):
+            for k in ("reg_disc", "reg_rag", "reg_prio", "reg_cp", "reg_appr",
+                      "reg_trend", "reg_person", "reg_search"):
+                st.session_state[k] = "All"
+            st.session_state["reg_search"] = ""
+            st.rerun()
 
     # ── Column config ─────────────────────────────────────────────────────────
     col_cfg = {
@@ -2067,6 +2231,39 @@ def page_document_detail(df: pd.DataFrame, current_user: str):
     row = df[df["mdr_id"] == selected].iloc[0]
     _log("LOAD", f"Document detail view for {selected}")
 
+    # ── Early lookup: resolved author value ───────────────────────────────────
+    # The 'author' field lives in the source system (wc_author on Windchill) and
+    # is NOT in mdr_requirements.csv.  When the DC resolves a MISSING_MANDATORY_FIELD
+    # flag for 'author', the corrected value lands in edit_log.csv.  We look it up
+    # here so it can be shown in the Responsibility section at the top of the page,
+    # not just buried in the DQ Flag History section at the bottom.
+    _detail_author = "—"
+    if DQ_FLAGS_CSV.exists() and EDIT_LOG_CSV.exists():
+        _dq_snap = pd.read_csv(DQ_FLAGS_CSV)
+        _elog_snap = pd.read_csv(EDIT_LOG_CSV)
+        # Find all DQ flags for this document that are about the 'author' field
+        _author_flags = _dq_snap[
+            (_dq_snap["mdr_id"] == selected)
+            & (_dq_snap["field_name"] == "author")
+        ]
+        if not _author_flags.empty:
+            # Try to find the DC's corrected value in edit_log for any of these flags
+            for _fid in _author_flags["flag_id"].tolist():
+                _res = _elog_snap[
+                    (_elog_snap["mdr_id"] == selected)
+                    & (_elog_snap["field"] == f"dq_flag_resolved:{_fid}")
+                ]
+                if not _res.empty:
+                    _raw = str(_res.iloc[0].get("new_value", ""))
+                    if _raw and _raw.lower() not in ("nan", ""):
+                        _detail_author = _raw
+                        break
+            # If still not resolved, check if the flag itself has a suggested value
+            if _detail_author == "—":
+                _sugg = str(_author_flags.iloc[0].get("suggested_value", ""))
+                if _sugg and _sugg.lower() not in ("nan", ""):
+                    _detail_author = f"{_sugg} (pipeline suggestion)"
+
     st.markdown("---")
 
     # ── Document header ───────────────────────────────────────────────────────
@@ -2164,7 +2361,7 @@ def page_document_detail(df: pd.DataFrame, current_user: str):
 
     # ── Responsibility ────────────────────────────────────────────────────────
     st.markdown("**Responsibility**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.caption("Responsible Person")
         st.markdown(f"**{row['responsible_person']}**")
@@ -2175,6 +2372,13 @@ def page_document_detail(df: pd.DataFrame, current_user: str):
         st.caption("Certifying Body")
         cb = row.get("certifying_body")
         st.markdown(f"**{cb if pd.notna(cb) and str(cb).strip() else '—'}**")
+    with c4:
+        # Author comes from the source system (wc_author on Windchill); it is not
+        # stored in mdr_requirements.csv.  The value shown here is the DC-corrected
+        # value from the DQ remediation audit trail (looked up at the top of this
+        # function).  Shows '—' if no DQ flag for author exists or it is unresolved.
+        st.caption("Author")
+        st.markdown(f"**{_detail_author}**")
 
     # ── Notes (only shown if present) ────────────────────────────────────────
     notes_val = row.get("notes")
@@ -2266,6 +2470,433 @@ def page_document_detail(df: pd.DataFrame, current_user: str):
         f"{len(events)} events  |  source: staged_events.csv  |  "
         f"document_id: {doc_uuid}"
     )
+
+    # ── DQ Flag History ───────────────────────────────────────────────────────
+    # Show every pipeline DQ flag for this document, grouped by resolved / open.
+    # Resolved flags also show the corrected value entered by the DC (from edit_log).
+    # This is the "author field" and similar corrections made visible on the detail page.
+    st.markdown("---")
+    st.markdown("### Data Quality Flag History")
+    st.caption(
+        "DQ flags raised by the pipeline at ingest time for this document, "
+        "and DC corrections applied via the Remediation Queue."
+    )
+
+    # Load DQ flags and filter to this document
+    doc_dq = pd.DataFrame()
+    if DQ_FLAGS_CSV.exists():
+        _dq_all = pd.read_csv(DQ_FLAGS_CSV)
+        _dq_all["resolved"] = _dq_all["resolved"].astype(str).str.lower() == "true"
+        doc_dq = _dq_all[_dq_all["mdr_id"] == selected].copy()
+
+    # Load edit log corrections for this document (DQ_REMEDIATION events)
+    dc_corrections = {}  # flag_id -> {"corrected_value": ..., "resolved_by": ..., "resolved_at": ...}
+    if EDIT_LOG_CSV.exists():
+        _elog = pd.read_csv(EDIT_LOG_CSV)
+        _dc_events = _elog[
+            (_elog["mdr_id"] == selected)
+            & _elog["field"].str.startswith("dq_flag_resolved:", na=False)
+        ].copy()
+        for _, ev in _dc_events.iterrows():
+            fid = str(ev["field"]).replace("dq_flag_resolved:", "")
+            dc_corrections[fid] = {
+                "corrected_value": str(ev.get("new_value", "")),
+                "resolved_by":     str(ev.get("username", "")),
+                "resolved_at":     str(ev.get("timestamp", ""))[:19],
+            }
+
+    if doc_dq.empty:
+        st.info("No DQ flags raised for this document by the pipeline.")
+    else:
+        resolved_dq   = doc_dq[doc_dq["resolved"]]
+        unresolved_dq = doc_dq[~doc_dq["resolved"]]
+
+        if not resolved_dq.empty:
+            st.markdown(
+                f'<div style="font-size:0.75rem; color:#22c55e; margin:0.25rem 0 0.5rem 0;">'
+                f'<b>{len(resolved_dq)}</b> flag(s) resolved</div>',
+                unsafe_allow_html=True,
+            )
+            for _, dqrow in resolved_dq.iterrows():
+                fid    = str(dqrow["flag_id"])
+                field  = str(dqrow.get("field_name", "—"))
+                ftype  = str(dqrow.get("flag_type", ""))
+                orig   = str(dqrow.get("original_value", ""))
+                sugg   = str(dqrow.get("suggested_value", ""))
+                corr   = dc_corrections.get(fid, {})
+                corrected_val = corr.get("corrected_value", sugg or "see audit trail")
+                resolved_by   = corr.get("resolved_by",  str(dqrow.get("resolved_by", "")))
+                resolved_at   = corr.get("resolved_at",  str(dqrow.get("resolved_at", ""))[:19])
+                st.markdown(
+                    f'<div style="background:#1a2b1a; border:1px solid #22c55e33; border-left:3px solid #22c55e; '
+                    f'border-radius:4px; padding:0.6rem 1rem; margin-bottom:0.4rem; font-size:0.8rem;">'
+                    f'<b style="color:#22c55e;">{fid}</b> &nbsp; <span style="color:#7a8499;">{ftype}</span>'
+                    f'<br><span style="color:#e8ecf4;">Field: <b>{field}</b></span>'
+                    + (f'&nbsp;&nbsp; Original: <code>{orig}</code>' if orig else '')
+                    + f'&nbsp;&nbsp; <b>Corrected value: <span style="color:#22c55e;">{corrected_val}</span></b>'
+                    + f'<br><span style="color:#4a5568;">Resolved by {resolved_by} at {resolved_at}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        if not unresolved_dq.empty:
+            st.markdown(
+                f'<div style="font-size:0.75rem; color:#ef4444; margin:0.5rem 0 0.5rem 0;">'
+                f'<b>{len(unresolved_dq)}</b> open flag(s) — pending DC action</div>',
+                unsafe_allow_html=True,
+            )
+            for _, dqrow in unresolved_dq.iterrows():
+                fid   = str(dqrow["flag_id"])
+                field = str(dqrow.get("field_name", "—"))
+                ftype = str(dqrow.get("flag_type", ""))
+                orig  = str(dqrow.get("original_value", ""))
+                sugg  = str(dqrow.get("suggested_value", ""))
+                det   = str(dqrow.get("flag_detail", ""))
+                st.markdown(
+                    f'<div style="background:#2b1a1a; border:1px solid #ef444433; border-left:3px solid #ef4444; '
+                    f'border-radius:4px; padding:0.6rem 1rem; margin-bottom:0.4rem; font-size:0.8rem;">'
+                    f'<b style="color:#ef4444;">{fid}</b> &nbsp; <span style="color:#7a8499;">{ftype}</span>'
+                    f'<br><span style="color:#e8ecf4;">Field: <b>{field}</b></span>'
+                    + (f'&nbsp;&nbsp; Original: <code>{orig}</code>' if orig else '')
+                    + (f'&nbsp;&nbsp; Suggested: <code>{sugg}</code>' if sugg else '')
+                    + f'<br><span style="color:#4a5568;">{det[:120]}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            st.caption(
+                "Go to Source System Health > DC Remediation Queue to resolve these flags. "
+                "In a production CDE, resolving a flag triggers a write-back to the source "
+                "system and a pipeline re-ingest — the corrected value would then appear "
+                "in the Resolved section above automatically."
+            )
+
+    # ── Dashboard Edit History ────────────────────────────────────────────────
+    # All PM_UPDATE and DQ_REMEDIATION events logged via the dashboard for this document.
+    # Separated from the STAGED timeline (pipeline events only) to maintain clean lineage.
+    st.markdown("---")
+    st.markdown("### Dashboard Edit History")
+    st.caption(
+        "All changes made to this document through the dashboard (Project Manager priority/schedule "
+        "edits and Document Controller DQ flag resolutions). Separate from the pipeline lifecycle "
+        "timeline above — these are human actions, not ingestion events."
+    )
+
+    if not EDIT_LOG_CSV.exists():
+        st.info("No dashboard edits recorded for this document yet.")
+    else:
+        _elog_all = pd.read_csv(EDIT_LOG_CSV)
+        doc_edits = _elog_all[_elog_all["mdr_id"] == selected].copy()
+        if doc_edits.empty:
+            st.info("No dashboard edits recorded for this document yet.")
+        else:
+            doc_edits = doc_edits.sort_values("timestamp", ascending=False).reset_index(drop=True)
+
+            # Friendly field label — strip the "dq_flag_resolved:" prefix for display
+            def _friendly_field(f):
+                if str(f).startswith("dq_flag_resolved:"):
+                    return "DC flag resolved: " + str(f).replace("dq_flag_resolved:", "")
+                return str(f)
+
+            doc_edits["event_type"] = doc_edits["field"].apply(
+                lambda f: "DC Remediation" if str(f).startswith("dq_flag_resolved:") else "PM Update"
+            )
+            doc_edits["field_display"] = doc_edits["field"].apply(_friendly_field)
+
+            st.dataframe(
+                doc_edits[["timestamp", "username", "event_type", "field_display", "old_value", "new_value"]],
+                column_config={
+                    "timestamp":     st.column_config.TextColumn("When",        width="medium"),
+                    "username":      st.column_config.TextColumn("Who",         width="small"),
+                    "event_type":    st.column_config.TextColumn("Type",        width="small"),
+                    "field_display": st.column_config.TextColumn("Field / Flag",width="medium"),
+                    "old_value":     st.column_config.TextColumn("Old Value",   width="medium"),
+                    "new_value":     st.column_config.TextColumn("New Value",   width="medium"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+
+
+def page_audit_trail(current_user: str):
+    """Unified Audit Trail page.
+
+    Combines three event streams into one filterable log:
+
+    1. **Pipeline — Automated**: rows from staged_transformation_log.csv. Each row
+       is a field-level normalisation that happened at pipeline run time (e.g.
+       "I&C" -> "Instrumentation"). Actor = "pipeline".
+
+    2. **PM Update**: rows from edit_log.csv where the field column is NOT prefixed
+       "dq_flag_resolved:". These are Project Manager edits (priority, critical path,
+       % complete, notes). Actor = the username from the row.
+
+    3. **DC Resolution**: rows from edit_log.csv where field starts with
+       "dq_flag_resolved:". These are Document Controller flag resolutions.
+       If the new_value matches the pipeline's suggested_value for a normalisation
+       flag, the event is classified "Pipeline — Confirmed by Human". Otherwise it
+       is "Human — DC Resolution".
+
+    Filter controls: actor type, specific actor, document (mdr_id).
+
+    Args:
+        current_user: Currently active mock user (not used for filtering by default;
+                      shown in the header so the user knows whose session this is).
+    """
+    st.markdown('<div class="page-title">Audit Trail</div>', unsafe_allow_html=True)
+    st.caption(
+        "All events that have modified or confirmed data in this project: "
+        "pipeline transformations, PM edits, and DC flag resolutions."
+    )
+
+    # ── Load event sources ─────────────────────────────────────────────────────
+
+    # --- Source 1: pipeline transformation log (staged_transformation_log.csv) ---
+    # Each row = one field normalisation applied at pipeline ingest time.
+    # We do not have a real timestamp so we mark these as "pipeline run" events.
+    pipeline_rows = []
+    if TRANSFORMATION_LOG_CSV.exists():
+        _log("LOAD", f"Audit Trail: reading transformation log from {TRANSFORMATION_LOG_CSV}")
+        tlog = pd.read_csv(TRANSFORMATION_LOG_CSV)
+        # Convert all string cols from StringDtype (pandas 3.0) to object
+        str_cols = tlog.select_dtypes(include="string").columns.tolist()
+        if str_cols:
+            tlog[str_cols] = tlog[str_cols].astype(object)
+        for _, r in tlog.iterrows():
+            pipeline_rows.append({
+                "timestamp":  pd.NaT,             # pipeline events have no wall-clock ts
+                "actor":      "pipeline",
+                "actor_type": "Pipeline -- Automated",
+                "mdr_id":     str(r.get("mdr_id", "")),
+                "event_type": "Pipeline Transform",
+                "field":      str(r.get("field_name", "")),
+                "from_val":   str(r.get("original_value", "")),
+                "to_val":     str(r.get("normalised_value", "")),
+                "note":       str(r.get("normalisation_rule", "")),
+            })
+    else:
+        _log("ERROR", f"Audit Trail: transformation log not found at {TRANSFORMATION_LOG_CSV}")
+        st.warning(
+            "staged_transformation_log.csv not found. "
+            "Run data_generation/generate_staged_layer.py to populate it."
+        )
+
+    # --- Source 2 + 3: edit_log.csv (PM edits and DC resolutions) ---
+
+    # Build a flag_id -> field_name lookup from staged_dq_flags.csv so that
+    # DC resolution events in the audit trail show the actual field that was
+    # corrected (e.g. "author") rather than just the opaque flag ID ("DQF-0001").
+    _flag_field_map: dict[str, str] = {}
+    if DQ_FLAGS_CSV.exists():
+        try:
+            _dq_for_audit = pd.read_csv(DQ_FLAGS_CSV)
+            _flag_field_map = dict(
+                zip(
+                    _dq_for_audit["flag_id"].astype(str),
+                    _dq_for_audit["field_name"].astype(str),
+                )
+            )
+        except Exception:
+            pass  # non-fatal; flag IDs will still be shown as-is
+
+    edit_rows = []
+    if EDIT_LOG_CSV.exists():
+        _log("LOAD", f"Audit Trail: reading edit log from {EDIT_LOG_CSV}")
+        elog = pd.read_csv(EDIT_LOG_CSV)
+        str_cols = elog.select_dtypes(include="string").columns.tolist()
+        if str_cols:
+            elog[str_cols] = elog[str_cols].astype(object)
+
+        for _, r in elog.iterrows():
+            field_val = str(r.get("field", ""))
+            actor     = str(r.get("username", ""))
+            ts_raw    = r.get("timestamp")
+            try:
+                ts = pd.to_datetime(ts_raw, utc=True)
+            except Exception:
+                ts = pd.NaT
+
+            if field_val.startswith("dq_flag_resolved:"):
+                # DC resolution — classify as "confirmed by pipeline" if the new_value
+                # matches the suggested normalised value (i.e. DC confirmed the mapping
+                # rather than supplying a freetext correction).
+                flag_id  = field_val.split(":", 1)[1]
+                new_val  = str(r.get("new_value", ""))
+                old_val  = str(r.get("old_value", ""))
+                # Show "field_name (flag_id)" so the user can see WHAT was corrected
+                # (e.g. "author (DQF-0001)") without needing to cross-reference the flag table.
+                field_display = _flag_field_map.get(flag_id, flag_id)
+                if field_display != flag_id:
+                    field_display = f"{field_display} ({flag_id})"
+
+                # Check whether this resolution confirmed a pipeline suggestion by
+                # looking up the flag in the transformation log rows we already have.
+                # A pipeline-suggested value is one where the pipeline produced a
+                # normalised_value and the DC wrote exactly that value.
+                is_pipeline_confirmed = any(
+                    pr["to_val"] == new_val and pr["mdr_id"] == str(r.get("mdr_id", ""))
+                    for pr in pipeline_rows
+                )
+                actor_type = (
+                    "Pipeline -- Confirmed by Human"
+                    if is_pipeline_confirmed
+                    else "Human -- DC Resolution"
+                )
+                edit_rows.append({
+                    "timestamp":  ts,
+                    "actor":      actor,
+                    "actor_type": actor_type,
+                    "mdr_id":     str(r.get("mdr_id", "")),
+                    "event_type": "DQ Resolution",
+                    "field":      field_display,   # e.g. "author (DQF-0001)"
+                    "from_val":   old_val,
+                    "to_val":     new_val,
+                    "note":       "",
+                })
+            else:
+                # PM edit — priority, critical path, % complete, notes, etc.
+                edit_rows.append({
+                    "timestamp":  ts,
+                    "actor":      actor,
+                    "actor_type": "Human -- PM Edit",
+                    "mdr_id":     str(r.get("mdr_id", "")),
+                    "event_type": "PM Edit",
+                    "field":      field_val,
+                    "from_val":   str(r.get("old_value", "")),
+                    "to_val":     str(r.get("new_value", "")),
+                    "note":       "",
+                })
+    else:
+        _log("ERROR", f"Audit Trail: edit log not found at {EDIT_LOG_CSV}")
+        st.warning("No edit_log.csv found — no PM edits or DC resolutions to display.")
+
+    # ── Build combined DataFrame ───────────────────────────────────────────────
+    all_events = pipeline_rows + edit_rows
+    if not all_events:
+        st.info("No audit events found.")
+        return
+
+    audit = pd.DataFrame(all_events)
+
+    # Sort: timestamped events first (newest first), then pipeline events (no ts) last
+    has_ts  = audit["timestamp"].notna()
+    ts_part = audit[has_ts].sort_values("timestamp", ascending=False)
+    no_ts   = audit[~has_ts]
+    audit   = pd.concat([ts_part, no_ts], ignore_index=True)
+
+    _log("LOAD", f"Audit Trail: {len(audit)} total events ({len(pipeline_rows)} pipeline, {len(edit_rows)} human)")
+
+    # ── Filter controls ────────────────────────────────────────────────────────
+    st.markdown("---")
+    f1, f2, f3 = st.columns(3)
+
+    # Actor type filter — covers the four categories defined above
+    all_actor_types = sorted(audit["actor_type"].unique().tolist())
+    with f1:
+        sel_type = st.selectbox(
+            "Actor type",
+            ["All"] + all_actor_types,
+            key="aud_actor_type",
+        )
+
+    # Specific actor filter — "pipeline" plus all real usernames
+    all_actors = sorted(audit["actor"].unique().tolist())
+    with f2:
+        sel_actor = st.selectbox(
+            "Specific actor",
+            ["All"] + all_actors,
+            key="aud_actor",
+        )
+
+    # Document filter — mdr_id dropdown (show only docs that have events)
+    all_docs = sorted(audit["mdr_id"].unique().tolist())
+    with f3:
+        sel_doc = st.selectbox(
+            "Document (MDR ID)",
+            ["All"] + all_docs,
+            key="aud_doc",
+        )
+
+    # Apply filters
+    filtered = audit.copy()
+    if sel_type != "All":
+        filtered = filtered[filtered["actor_type"] == sel_type]
+    if sel_actor != "All":
+        filtered = filtered[filtered["actor"] == sel_actor]
+    if sel_doc != "All":
+        filtered = filtered[filtered["mdr_id"] == sel_doc]
+
+    _log("FILTER", f"Audit Trail: {len(filtered)} of {len(audit)} events after filter")
+
+    st.markdown(f"**{len(filtered)}** events")
+    st.markdown("")
+
+    # ── Display table ──────────────────────────────────────────────────────────
+    # Format timestamp for display — strip microseconds, show as date+time
+    def fmt_audit_ts(val):
+        """Render a Timestamp as 'YYYY-MM-DD HH:MM', or 'pipeline run' if NaT."""
+        if pd.isna(val):
+            return "pipeline run"
+        try:
+            return str(val)[:16]   # '2026-05-11 16:28'
+        except Exception:
+            return str(val)
+
+    display = pd.DataFrame({
+        "When":       filtered["timestamp"].map(fmt_audit_ts),
+        "Actor":      filtered["actor"],
+        "Actor Type": filtered["actor_type"],
+        "Document":   filtered["mdr_id"],
+        "Event":      filtered["event_type"],
+        "Field":      filtered["field"],
+        "From":       filtered["from_val"],
+        "To":         filtered["to_val"],
+        "Note":       filtered["note"],
+    })
+
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "When":       st.column_config.TextColumn("When",        width="medium"),
+            "Actor":      st.column_config.TextColumn("Actor",       width="medium"),
+            "Actor Type": st.column_config.TextColumn("Actor Type",  width="large"),
+            "Document":   st.column_config.TextColumn("Document",    width="large"),
+            "Event":      st.column_config.TextColumn("Event",       width="medium"),
+            "Field":      st.column_config.TextColumn("Field",       width="medium"),
+            "From":       st.column_config.TextColumn("From",        width="medium"),
+            "To":         st.column_config.TextColumn("To",          width="medium"),
+            "Note":       st.column_config.TextColumn("Note",        width="large"),
+        },
+    )
+
+    # ── Navigate to Document Detail for the filtered document ────────────────
+    # Only show this when the user has filtered to a single document; it makes
+    # no sense when "All" documents are shown in the table.
+    if sel_doc != "All":
+        if st.button(
+            f"Open {sel_doc} in Document Detail ->",
+            key="aud_trail_open_detail",
+            type="secondary",
+        ):
+            st.session_state["_nav_request"]    = "Document Detail"
+            st.session_state["_detail_request"] = sel_doc
+            st.rerun()
+
+    # ── Legend ─────────────────────────────────────────────────────────────────
+    with st.expander("Actor type legend", expanded=False):
+        st.markdown(
+            "**Pipeline -- Automated**: normalisation applied automatically at pipeline "
+            "ingest time (e.g. discipline code expansion, status vocabulary mapping). "
+            "No human involved.\n\n"
+            "**Pipeline -- Confirmed by Human**: a DC saw the pipeline's suggested "
+            "mapping and pressed 'Confirm mapping' — they did not change the value, "
+            "they confirmed it. Counts as human sign-off on the pipeline's decision.\n\n"
+            "**Human -- DC Resolution**: a DC supplied a value the pipeline could not "
+            "determine automatically (e.g. filled a missing author).\n\n"
+            "**Human -- PM Edit**: a Project Manager changed a planning field "
+            "(priority, critical path, % complete, or notes)."
+        )
 
 
 def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
@@ -2387,14 +3018,19 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
             st.info(f"Read Only — switch to {ROLE_DOCUMENT_CONTROLLER} in the sidebar to resolve DQ flags.")
 
         # ── Filter controls ───────────────────────────────────────────────────────
-        fc1, fc2, _ = st.columns([2, 3, 3])
+        fc1, fc2, fc3 = st.columns([2, 3, 2])
         src_options  = ["All"] + sorted(dq_raw["source_system"].dropna().unique().tolist())
         type_options = ["All"] + sorted(dq_raw["flag_type"].dropna().unique().tolist())
-        sel_src  = fc1.selectbox("Source system", src_options,  key="health_src_filter")
-        sel_type = fc2.selectbox("Flag type",     type_options, key="health_type_filter")
+        sel_src       = fc1.selectbox("Source system", src_options,  key="health_src_filter")
+        sel_type      = fc2.selectbox("Flag type",     type_options, key="health_type_filter")
+        show_resolved = fc3.checkbox(
+            "Show resolved flags",
+            key="health_show_resolved",
+            help="Include flags that have already been resolved by a Document Controller.",
+        )
 
-        # Always show only unresolved flags in the remediation queue
-        queue = dq_raw[~dq_raw["resolved"]].copy()
+        # By default show only unresolved flags; toggle includes resolved ones too.
+        queue = dq_raw.copy() if show_resolved else dq_raw[~dq_raw["resolved"]].copy()
         if sel_src  != "All":
             queue = queue[queue["source_system"] == sel_src]
         if sel_type != "All":
@@ -2402,30 +3038,38 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
 
         _log("FILTER", f"Health queue — src={sel_src} type={sel_type} -> {len(queue)} flags")
 
+        n_unresolved = int((~queue["resolved"]).sum())
+        n_shown      = len(queue)
         st.markdown(
             f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
-            f'Showing <b>{len(queue)}</b> unresolved flags</div>',
+            f'Showing <b>{n_shown}</b> flag(s)'
+            f' — <b style="color:#ef4444;">{n_unresolved} unresolved</b>'
+            f', <b style="color:#22c55e;">{n_shown - n_unresolved} resolved</b>'
+            f'</div>',
             unsafe_allow_html=True,
         )
 
         if queue.empty:
-            st.success("No unresolved flags for the selected filters — all clear.")
+            st.success("No flags for the selected filters — all clear.")
         else:
             # ── Per-flag resolution cards ─────────────────────────────────────────────
             # Each flag is an expander.  DCs see a value input + Confirm button inside.
             # In a real system the confirmed value would update the source system record;
             # here it is captured in the audit log (edit_log.csv) and the flag is closed.
             for _, row in queue.iterrows():
-                flag_id  = str(row["flag_id"])
-                ftype    = str(row.get("flag_type",      ""))
-                field    = str(row.get("field_name",     "—"))
-                orig     = str(row.get("original_value", ""))
-                sugg     = str(row.get("suggested_value",""))
-                detail   = str(row.get("flag_detail",    ""))
-                mdr_id   = str(row.get("mdr_id",         ""))
-                src_sys  = str(row.get("source_system",  ""))
+                flag_id    = str(row["flag_id"])
+                ftype      = str(row.get("flag_type",      ""))
+                field      = str(row.get("field_name",     "—"))
+                orig       = str(row.get("original_value", ""))
+                sugg       = str(row.get("suggested_value",""))
+                detail     = str(row.get("flag_detail",    ""))
+                mdr_id     = str(row.get("mdr_id",         ""))
+                src_sys    = str(row.get("source_system",  ""))
+                is_resolved = bool(row.get("resolved", False))
 
-                label = f"{flag_id}  |  {src_sys}  |  {ftype}  |  field: {field}"
+                # Visual marker so resolved flags are distinguishable at a glance
+                status_tag = " [RESOLVED]" if is_resolved else ""
+                label = f"{flag_id}{status_tag}  |  {src_sys}  |  {ftype}  |  field: {field}"
                 with st.expander(label, expanded=False):
                     # Flag metadata
                     m1, m2, m3 = st.columns(3)
@@ -2440,43 +3084,121 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
                     if detail:
                         st.caption(detail)
 
-                    if is_dc:
-                        # Prompt for the corrected value or resolution note
-                        placeholder = (
-                            f"Enter corrected {field} value..." if ftype == "MISSING_MANDATORY_FIELD"
-                            else "Enter resolution note or confirmed correct value..."
+                    # ── Show resolution summary if the flag is already resolved ────────
+                    if is_resolved:
+                        resolved_by = str(row.get("resolved_by", ""))
+                        resolved_at = str(row.get("resolved_at", ""))
+                        st.success(
+                            f"Resolved by **{resolved_by}** at {resolved_at[:19]}  \n"
+                            f"See Resolution Audit Trail tab for the corrected value."
                         )
-                        resolution_val = st.text_input(
-                            "Resolution value / note",
-                            key=f"resolve_val_{flag_id}",
-                            placeholder=placeholder,
-                            help=(
-                                "For missing fields: enter the actual value (e.g. the author name). "
-                                "For normalisation issues: confirm the correct canonical value. "
-                                "For duplicates: describe which record was kept. "
-                                "This is recorded in the audit log."
-                            ),
+                        # Navigation link to Document Detail for this document
+                        if st.button(
+                            f"View {mdr_id} in Document Detail ->",
+                            key=f"btn_detail_{flag_id}",
+                        ):
+                            st.session_state["_nav_request"]    = "Document Detail"
+                            st.session_state["_detail_request"] = mdr_id
+                            st.rerun()
+
+                    elif is_dc:
+                        # ── Resolution UX — varies by flag type ───────────────────────────
+                        #
+                        # NORMALISATION_REQUIRED with a suggested value:
+                        #   The pipeline already knows the correct canonical value — the DC
+                        #   only needs to confirm it.  A single button is clearer than a text
+                        #   input (and avoids audit trail entries like old=I&C, new=confirmed).
+                        #
+                        # Everything else (MISSING_MANDATORY_FIELD, DUPLICATE_CANDIDATE, or
+                        # NORMALISATION_REQUIRED without a suggested value):
+                        #   The DC must supply the actual corrected value, so a text input
+                        #   is required.
+
+                        is_norm_with_suggestion = (
+                            ftype == "NORMALISATION_REQUIRED" and bool(sugg.strip())
                         )
-                        if st.button("Confirm Resolved", key=f"btn_resolve_{flag_id}", type="primary"):
-                            if resolution_val.strip():
+
+                        if is_norm_with_suggestion:
+                            # One-click confirm — writes the suggested canonical value, not
+                            # a free-text note, so the audit trail reads correctly:
+                            # old = original source value, new = canonical mapped value.
+                            st.info(
+                                f"Pipeline mapping: `{orig}` → `{sugg}`  \n"
+                                f"This mapping was applied automatically with HIGH confidence. "
+                                f"Confirm to close the flag and record your sign-off."
+                            )
+                            if st.button(
+                                f"Confirm mapping: {orig} -> {sugg}",
+                                key=f"btn_resolve_{flag_id}",
+                                type="primary",
+                            ):
                                 now_str = str(datetime.now(timezone.utc))
                                 mask = dq_raw["flag_id"] == flag_id
                                 dq_raw.loc[mask, "resolved"]    = True
                                 dq_raw.loc[mask, "resolved_by"] = current_user
                                 dq_raw.loc[mask, "resolved_at"] = now_str
-                                # Log to audit trail: old value = original, new value = resolution
+                                # Write the canonical suggested value — not "confirmed" —
+                                # so the audit trail records the actual mapping applied.
                                 log_edit(
                                     current_user, mdr_id,
                                     f"dq_flag_resolved:{flag_id}",
                                     orig if orig else "MISSING",
-                                    resolution_val.strip(),
+                                    sugg,
                                 )
-                                _log("EDIT", f"DC {current_user} resolved {flag_id} on {mdr_id} -> '{resolution_val.strip()}'")
+                                _log("EDIT", f"DC {current_user} confirmed normalisation {flag_id} on {mdr_id}: '{orig}' -> '{sugg}'")
                                 save_dq_flags(dq_raw)
-                                st.toast(f"{flag_id} marked as resolved.", icon="✅")
+                                st.toast(f"{flag_id} confirmed and resolved.")
                                 st.rerun()
-                            else:
-                                st.warning("Enter a resolution value before confirming. In a real system this becomes the corrected field value in the source record.")
+                        else:
+                            # DC must supply the corrected value (missing field, duplicate, or
+                            # normalisation without a suggested canonical value).
+                            placeholder = (
+                                f"Enter corrected {field} value..."
+                                if ftype == "MISSING_MANDATORY_FIELD"
+                                else "Describe which record was kept, or enter the correct value..."
+                            )
+                            resolution_val = st.text_input(
+                                "Resolution value / note",
+                                key=f"resolve_val_{flag_id}",
+                                placeholder=placeholder,
+                                help=(
+                                    "For missing fields: enter the actual value (e.g. the author name). "
+                                    "For duplicates: describe which record was kept and why. "
+                                    "This becomes the corrected value in the audit trail."
+                                ),
+                            )
+                            if st.button("Confirm Resolved", key=f"btn_resolve_{flag_id}", type="primary"):
+                                if resolution_val.strip():
+                                    now_str = str(datetime.now(timezone.utc))
+                                    mask = dq_raw["flag_id"] == flag_id
+                                    dq_raw.loc[mask, "resolved"]    = True
+                                    dq_raw.loc[mask, "resolved_by"] = current_user
+                                    dq_raw.loc[mask, "resolved_at"] = now_str
+                                    log_edit(
+                                        current_user, mdr_id,
+                                        f"dq_flag_resolved:{flag_id}",
+                                        orig if orig else "MISSING",
+                                        resolution_val.strip(),
+                                    )
+                                    _log("EDIT", f"DC {current_user} resolved {flag_id} on {mdr_id} -> '{resolution_val.strip()}'")
+                                    save_dq_flags(dq_raw)
+                                    st.toast(f"{flag_id} marked as resolved.")
+                                    st.rerun()
+                                else:
+                                    st.warning("Enter a resolution value before confirming. In a real system this becomes the corrected field value in the source record.")
+
+                        # Navigation link to Document Detail for this document
+                        # (shown for unresolved flags so the DC can review the full
+                        # document context before deciding how to resolve the flag).
+                        if st.button(
+                            f"View {mdr_id} in Document Detail ->",
+                            key=f"btn_detail_unres_{flag_id}",
+                            type="secondary",
+                        ):
+                            st.session_state["_nav_request"]    = "Document Detail"
+                            st.session_state["_detail_request"] = mdr_id
+                            st.rerun()
+
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2 — Pipeline Run Report (transformation log)
@@ -2494,6 +3216,16 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
 | **DQ Flag** (Remediation Queue tab) | The pipeline detected a data quality issue it could not safely resolve — a missing mandatory field, a non-standard value it couldn't map with confidence, or a format it couldn't parse. **Human action required.** | Document Controller |
 | **Transformation** (this tab) | The pipeline applied a deterministic, rule-based conversion with HIGH confidence — date format normalisation, vocabulary mapping, revision format conversion. **No action required — for information only.** | Nobody (automated) |
 
+**Confidence levels:**
+
+| Level | Meaning | Example |
+|---|---|---|
+| **HIGH** | Unambiguous, deterministic rule. No DQ flag raised. | `MECH` → `Mechanical` (standard code), `01/15/2025` → `2025-01-15` (known format) |
+| **MEDIUM** | Plausible mapping via extended lookup, but the source used a non-standard form. A DQ flag is ALSO raised so a DC can confirm. | `MECHANICAL` → `Mechanical` (full word instead of code), `I&C` → `Instrumentation` (vendor notation) |
+| **LOW** *(reserved)* | Fuzzy or inferred match with low certainty. Would be used for typos/near-matches (e.g. `MEXLXCL` ≈ `Mechanical`). Currently not produced — that level of ambiguity goes straight to a DQ flag with no suggested value. | — |
+
+Any code the pipeline cannot map at all (not in any lookup table, no close match) produces a DQ flag with no suggested value, and NO transformation record is written — the field is left as-is for the DC to correct manually.
+
 This distinction is the audit trail: every silent transformation is recorded here so nothing the pipeline does is invisible.
             """)
 
@@ -2508,11 +3240,15 @@ This distinction is the audit trail: every silent transformation is recorded her
             _log("LOAD", f"Transformation log loaded — {len(tx)} records")
 
             # ── Summary metrics ───────────────────────────────────────────────
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Total transformations", len(tx))
             m2.metric("Source systems", tx["source_system"].nunique())
             m3.metric("Fields transformed", tx["field_name"].nunique())
             m4.metric("Rules applied", tx["normalisation_rule"].nunique())
+            if "confidence" in tx.columns:
+                n_med = int((tx["confidence"] == "MEDIUM").sum())
+                m5.metric("MEDIUM confidence", n_med,
+                          help="Transformations the pipeline applied but flagged for DC confirmation.")
 
             # ── Breakdown charts ──────────────────────────────────────────────
             bc1, bc2 = st.columns(2)
@@ -2562,13 +3298,15 @@ This distinction is the audit trail: every silent transformation is recorded her
             # ── Full transformation log with filters ──────────────────────────
             st.markdown('<div class="section-header">Full Transformation Log</div>', unsafe_allow_html=True)
 
-            tf1, tf2, tf3 = st.columns([2, 3, 3])
+            tf1, tf2, tf3, tf4 = st.columns([2, 3, 3, 3])
             tx_src_opts  = ["All"] + sorted(tx["source_system"].dropna().unique().tolist())
             tx_rule_opts = ["All"] + sorted(tx["normalisation_rule"].dropna().unique().tolist())
             tx_fld_opts  = ["All"] + sorted(tx["field_name"].dropna().unique().tolist())
+            tx_mdr_opts  = ["All"] + sorted(tx["mdr_id"].dropna().unique().tolist()) if "mdr_id" in tx.columns else ["All"]
             sel_tx_src  = tf1.selectbox("Source system", tx_src_opts,  key="tx_src_filter")
             sel_tx_rule = tf2.selectbox("Rule",          tx_rule_opts, key="tx_rule_filter")
             sel_tx_fld  = tf3.selectbox("Field",         tx_fld_opts,  key="tx_fld_filter")
+            sel_tx_mdr  = tf4.selectbox("Document (MDR ID)", tx_mdr_opts, key="tx_mdr_filter")
 
             tx_view = tx.copy()
             if sel_tx_src  != "All":
@@ -2577,8 +3315,10 @@ This distinction is the audit trail: every silent transformation is recorded her
                 tx_view = tx_view[tx_view["normalisation_rule"] == sel_tx_rule]
             if sel_tx_fld  != "All":
                 tx_view = tx_view[tx_view["field_name"] == sel_tx_fld]
+            if sel_tx_mdr  != "All" and "mdr_id" in tx_view.columns:
+                tx_view = tx_view[tx_view["mdr_id"] == sel_tx_mdr]
 
-            _log("FILTER", f"Transform log — src={sel_tx_src} rule={sel_tx_rule} field={sel_tx_fld} -> {len(tx_view)} rows")
+            _log("FILTER", f"Transform log — src={sel_tx_src} rule={sel_tx_rule} field={sel_tx_fld} mdr={sel_tx_mdr} -> {len(tx_view)} rows")
 
             st.markdown(
                 f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
@@ -2586,21 +3326,44 @@ This distinction is the audit trail: every silent transformation is recorded her
                 unsafe_allow_html=True,
             )
 
+            # Show run_timestamp if the column exists (added by the pipeline after
+            # a fresh generate_staged_layer.py run; may be absent in older files).
+            tx_display_cols = [c for c in [
+                "run_timestamp", "source_system", "source_native_id", "mdr_id",
+                "field_name", "original_value", "normalised_value",
+                "normalisation_rule", "confidence",
+            ] if c in tx_view.columns]
+
             st.dataframe(
-                tx_view.reset_index(drop=True),
+                tx_view[tx_display_cols].reset_index(drop=True),
                 column_config={
-                    "source_system":      st.column_config.TextColumn("Source",    width="small"),
-                    "source_native_id":   st.column_config.TextColumn("Source ID", width="small"),
+                    "run_timestamp":      st.column_config.TextColumn("Pipeline Run",width="medium"),
+                    "source_system":      st.column_config.TextColumn("Source",      width="small"),
+                    "source_native_id":   st.column_config.TextColumn("Source ID",   width="small"),
                     "mdr_id":             st.column_config.TextColumn("MDR ID"),
-                    "field_name":         st.column_config.TextColumn("Field",     width="small"),
-                    "original_value":     st.column_config.TextColumn("Original",  width="medium"),
-                    "normalised_value":   st.column_config.TextColumn("Normalised",width="medium"),
+                    "field_name":         st.column_config.TextColumn("Field",       width="small"),
+                    "original_value":     st.column_config.TextColumn("Original",    width="medium"),
+                    "normalised_value":   st.column_config.TextColumn("Normalised",  width="medium"),
                     "normalisation_rule": st.column_config.TextColumn("Rule"),
-                    "confidence":         st.column_config.TextColumn("Confidence",width="small"),
+                    "confidence":         st.column_config.TextColumn("Confidence",  width="small"),
                 },
                 hide_index=True,
                 width="stretch",
             )
+            if "run_timestamp" not in tx_view.columns:
+                st.caption("Pipeline Run column not present — re-run generate_staged_layer.py to populate it.")
+
+            # Navigate to Document Detail when a specific MDR ID is selected.
+            # Shows a button so the user can jump to the full document view.
+            if sel_tx_mdr != "All":
+                if st.button(
+                    f"Open {sel_tx_mdr} in Document Detail ->",
+                    key="tx_open_detail",
+                    type="secondary",
+                ):
+                    st.session_state["_nav_request"]    = "Document Detail"
+                    st.session_state["_detail_request"] = sel_tx_mdr
+                    st.rerun()
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 3 — Resolution Audit Trail
@@ -2640,25 +3403,68 @@ This table shows only the DQ remediation entries from that log. In a live system
                 # Sort newest first
                 dq_audit = dq_audit.sort_values("timestamp", ascending=False).reset_index(drop=True)
 
+                # ── Search filter ────────────────────────────────────────────────
+                at_search = st.text_input(
+                    "Search audit trail",
+                    placeholder="Filter by document ID, flag ID, user, or corrected value...",
+                    key="audit_trail_search",
+                    help="Case-insensitive partial match across all columns.",
+                )
+                if at_search.strip():
+                    q = at_search.strip().lower()
+                    dq_audit = dq_audit[
+                        dq_audit["mdr_id"].str.lower().str.contains(q, na=False)
+                        | dq_audit["flag_id"].str.lower().str.contains(q, na=False)
+                        | dq_audit["username"].str.lower().str.contains(q, na=False)
+                        | dq_audit["new_value"].astype(str).str.lower().str.contains(q, na=False)
+                        | dq_audit["old_value"].astype(str).str.lower().str.contains(q, na=False)
+                    ]
+
                 st.markdown(
-                    f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.75rem 0;">'
+                    f'<div style="font-size:0.75rem; color:#7a8499; margin:0.25rem 0 0.5rem 0;">'
                     f'<b>{len(dq_audit)}</b> DQ remediation event(s) on record.</div>',
                     unsafe_allow_html=True,
                 )
 
-                st.dataframe(
-                    dq_audit[["timestamp", "username", "mdr_id", "flag_id", "old_value", "new_value"]],
-                    column_config={
-                        "timestamp":  st.column_config.TextColumn("Resolved At",       width="medium"),
-                        "username":   st.column_config.TextColumn("Resolved By",       width="small"),
-                        "mdr_id":     st.column_config.TextColumn("Document (MDR ID)", width="medium"),
-                        "flag_id":    st.column_config.TextColumn("Flag",              width="small"),
-                        "old_value":  st.column_config.TextColumn("Original Value",    width="medium"),
-                        "new_value":  st.column_config.TextColumn("Corrected Value",   width="medium"),
-                    },
-                    hide_index=True,
-                    use_container_width=True,
-                )
+                # ── Per-row cards with inline Document Detail link ────────────────
+                # Rendered as column rows rather than st.dataframe so each row can have
+                # a live navigation button.  Streamlit's dataframe widget has no link cell type.
+                hc1, hc2, hc3, hc4, hc5, hc6, hc7 = st.columns([2.2, 1.2, 2.5, 1.0, 1.5, 1.5, 1.2])
+                for lbl, col in zip(
+                    ["Resolved At", "By", "Document (MDR ID)", "Flag", "Original", "Corrected", ""],
+                    [hc1, hc2, hc3, hc4, hc5, hc6, hc7],
+                ):
+                    col.markdown(
+                        f'<div style="font-size:0.68rem; font-weight:600; color:#4a5568; '
+                        f'padding-bottom:0.2rem; border-bottom:1px solid #2a3040;">{lbl}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                for _idx_r, ev_row in dq_audit.iterrows():
+                    rc1, rc2, rc3, rc4, rc5, rc6, rc7 = st.columns([2.2, 1.2, 2.5, 1.0, 1.5, 1.5, 1.2])
+                    rc1.markdown(
+                        f'<div style="font-size:0.75rem; color:#7a8499; padding:0.2rem 0;">'
+                        f'{str(ev_row.get("timestamp",""))[:19]}</div>', unsafe_allow_html=True)
+                    rc2.markdown(
+                        f'<div style="font-size:0.75rem; color:#e8ecf4; padding:0.2rem 0;">'
+                        f'{ev_row.get("username","")}</div>', unsafe_allow_html=True)
+                    rc3.markdown(
+                        f'<div style="font-size:0.72rem; color:#93c5fd; font-family:\'IBM Plex Mono\',monospace; padding:0.2rem 0;">'
+                        f'{ev_row.get("mdr_id","")}</div>', unsafe_allow_html=True)
+                    rc4.markdown(
+                        f'<div style="font-size:0.72rem; color:#7a8499; padding:0.2rem 0;">'
+                        f'{ev_row.get("flag_id","")}</div>', unsafe_allow_html=True)
+                    rc5.markdown(
+                        f'<div style="font-size:0.72rem; color:#ef4444; padding:0.2rem 0;">'
+                        f'<code>{str(ev_row.get("old_value",""))[:30]}</code></div>', unsafe_allow_html=True)
+                    rc6.markdown(
+                        f'<div style="font-size:0.72rem; color:#22c55e; padding:0.2rem 0;">'
+                        f'<b>{str(ev_row.get("new_value",""))[:30]}</b></div>', unsafe_allow_html=True)
+                    _doc_id = str(ev_row.get("mdr_id", ""))
+                    if rc7.button("View ->", key=f"audit_nav_{_idx_r}"):
+                        st.session_state["_nav_request"]    = "Document Detail"
+                        st.session_state["_detail_request"] = _doc_id
+                        st.rerun()
 
                 # Also show PM edits (non-DQ) as a secondary section so the full log is accessible
                 pm_audit = audit[~audit["field"].str.startswith("dq_flag_resolved:", na=False)].copy()
@@ -2694,12 +3500,27 @@ def main():
     st.html("""
     <script>
     (function() {
-        /* 1 — Prevent Ctrl+C from triggering Streamlit's "Clear cache" shortcut. */
-        window.addEventListener('keydown', function(e) {
+        /* 1 — Prevent Ctrl+C from triggering Streamlit's "Clear cache" shortcut.
+               Streamlit's keyboard handler lives on window.parent (the main page),
+               not on this iframe.  We therefore register the blocker on BOTH
+               the iframe window (belt) and the parent window (suspenders).
+               stopPropagation() alone is not enough once the event reaches the
+               parent — stopImmediatePropagation() stops other listeners on the
+               SAME target, which is what kills Streamlit's handler. */
+        function blockCtrlC(e) {
             if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
                 e.stopPropagation();
+                e.stopImmediatePropagation();
+                /* Do NOT call preventDefault() — that would block the browser's
+                   native copy action (the actual Clipboard API event is separate). */
             }
-        }, true);
+        }
+        window.addEventListener('keydown', blockCtrlC, true);
+        try {
+            /* window.parent may throw a SecurityError in cross-origin iframes;
+               guard with try/catch so the rest of the script still runs. */
+            window.parent.addEventListener('keydown', blockCtrlC, true);
+        } catch(err) {}
 
         /* 2 — Keep sidebar permanently open.
                Two mechanisms work together:
@@ -2745,9 +3566,38 @@ def main():
             }
         }
 
+        /* 3 — Auto-dismiss Streamlit's "Clear cache?" dialog.
+               Pressing Ctrl+C (Strg+C) triggers Streamlit's built-in 'c' keyboard
+               shortcut which opens the "Clear cache?" modal — even when Ctrl is held.
+               Our capture-phase listener above intercepts when it can, but event
+               registration order means Streamlit sometimes fires first.  As a
+               belt-and-suspenders, we watch the DOM for the dialog and click
+               "Cancel" automatically within ~100 ms if it appears. */
+        function dismissClearCacheDialog() {
+            /* Identify the modal by presence of a "Clear cache" button alongside
+               a "Cancel" button — this is unique to Streamlit's cache-clear dialog.
+               We do NOT use text-matching on the heading because Streamlit may
+               render it in shadow DOM or in a different element depending on version. */
+            var modals = doc.querySelectorAll('[role="dialog"]');
+            modals.forEach(function(modal) {
+                var btns = Array.from(modal.querySelectorAll('button'));
+                var hasClearBtn = btns.some(function(b) {
+                    return b.textContent.trim().toLowerCase().indexOf('clear cache') >= 0;
+                });
+                if (!hasClearBtn) return;
+                /* Found the Clear Cache dialog — locate and click Cancel. */
+                var cancelBtn = btns.find(function(b) {
+                    var t = b.textContent.trim().toLowerCase();
+                    return t === 'cancel' || t === 'abbrechen';
+                });
+                if (cancelBtn) cancelBtn.click();
+            });
+        }
+
         function fixSidebar() {
             hideCollapseBtn();
             expandIfCollapsed();
+            dismissClearCacheDialog();
         }
 
         /* Run on load — handle localStorage "collapsed" state and initial render. */
@@ -2798,6 +3648,8 @@ def main():
         page_document_detail(df, current_user)
     elif page == "Source System Health":
         page_source_health(df, current_user, active_role)
+    elif page == "Audit Trail":
+        page_audit_trail(current_user)
 
 
 if __name__ == "__main__":
