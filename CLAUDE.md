@@ -69,9 +69,11 @@ multisource-cde-mdr-pipeline/
 │   ├── staged_events.csv                 ← event log (~471 rows, canonical schema)
 │   ├── staged_cross_reference.csv        ← source_id -> mdr_id mapping (golden record table)
 │   ├── staged_dq_flags.csv               ← data quality issues flagged at pipeline time
+│   ├── staged_transformation_log.csv     ← per-record transformation trace written by generate_staged_layer.py
 │   │
 │   │   ANALYTICAL LAYER — reads staged outputs
 │   ├── generate_mdr_layer.py             ← builds MDR register from harmonised data
+│   ├── raw_documents.csv                 ← intermediate: canonical mdr_id + document_type, read by generate_mdr_layer.py
 │   ├── mdr_requirements.csv              ← source of truth for dashboard edits (60 rows)
 │   │
 │   │   LOAD
@@ -108,6 +110,14 @@ aveva_source.csv      ──┘                              ► staged_cross_re
                                                       generate_mdr_layer.py
                                                               │
                                                        mdr_requirements.csv
+                                                              │
+                                                      load_to_snowflake.py
+                                                              │
+                              RAW.WINDCHILL_DOCUMENTS  (30 rows — source-native)
+                              RAW.SHAREPOINT_DOCUMENTS (20 rows — source-native)
+                              RAW.AVEVA_DOCUMENTS      (10 rows — source-native)
+                              STAGED.EVENTS            (~510 rows — harmonised)
+                              ANALYTICAL.MDR_REQUIREMENTS (60 rows — dashboard)
 ```
 
 **Key principle:** Data quality detection is a pipeline responsibility, not a dashboard responsibility.
@@ -201,6 +211,7 @@ Per source system, the page shows:
 | `generate_aveva_source.py` | ✅ Complete | 10 rows, source-native schema, 1 DQ issue injected |
 | `generate_staged_layer.py` | ✅ Complete | Harmonises all 3 sources, detects 61 DQ flags, writes 4 output files + `staged_transformation_log.csv` |
 | `generate_mdr_layer.py` | ✅ Complete | Option B RAG thresholds: separate Critical Path tier (AMBER ≤ 14d, RED ≤ 3d). Uses ISO 19650 IDs from STAGED. |
+| `load_to_snowflake.py` | ✅ Complete | Loads 5 tables: RAW.WINDCHILL_DOCUMENTS, RAW.SHAREPOINT_DOCUMENTS, RAW.AVEVA_DOCUMENTS, STAGED.EVENTS, ANALYTICAL.MDR_REQUIREMENTS. Source-native date formats preserved in RAW. |
 | Role selector (dashboard) | ✅ Complete | st.radio in sidebar: Read Only / Project Manager / Document Controller. Switching user auto-sets role and pre-filters MDR discipline. |
 | Source System Health page | ✅ Complete | 3 tabs: DC Remediation Queue, Pipeline Run Report (transformation log), Resolution Audit Trail (edit_log.csv) |
 
@@ -256,12 +267,12 @@ use the staging keys.
 
 ### Pre-interview checklist (do this before any interview)
 
-1. **Sync Snowflake** — CSV data was regenerated (IDs and titles changed). Snowflake is stale.
+1. **Sync Snowflake** — run the load script to push all five tables (safe to rerun, uses CREATE OR REPLACE):
    ```powershell
    cd data_generation
    python load_to_snowflake.py
    ```
-   Verify the dashboard reads STAGED data from Snowflake correctly after the sync.
+   Expected output: 30 + 20 + 10 rows into RAW, 510 into STAGED, 60 into ANALYTICAL.
 
 2. **Dress rehearsal** — run through the demo path end to end, in order:
    - Overview → explain the business problem (RAG tiles, Critical Path panel)
@@ -413,10 +424,10 @@ The terminal will print extra detail on every lifecycle event.
 
 | Layer | Table / File | Rows | Where |
 |---|---|---|---|
-| SOURCE | `windchill_source.csv` | 30 | CSV only |
-| SOURCE | `sharepoint_source.csv` | 20 | CSV only |
-| SOURCE | `aveva_source.csv` | 10 | CSV only |
-| STAGED | `STAGED.EVENTS` / `staged_events.csv` | ~471 | Snowflake + CSV |
+| RAW | `RAW.WINDCHILL_DOCUMENTS` / `windchill_source.csv` | 30 | Snowflake + CSV |
+| RAW | `RAW.SHAREPOINT_DOCUMENTS` / `sharepoint_source.csv` | 20 | Snowflake + CSV |
+| RAW | `RAW.AVEVA_DOCUMENTS` / `aveva_source.csv` | 10 | Snowflake + CSV |
+| STAGED | `STAGED.EVENTS` / `staged_events.csv` | ~510 | Snowflake + CSV |
 | STAGED | `staged_cross_reference.csv` | 60 | CSV only |
 | STAGED | `staged_dq_flags.csv` | ~15 | CSV only |
 | ANALYTICAL | `ANALYTICAL.MDR_REQUIREMENTS` / `mdr_requirements.csv` | 60 | Snowflake + CSV |
@@ -451,7 +462,12 @@ Populated at pipeline run time. Read by Source System Health page. Resolved by D
 - **Database:** `WINDCHILL_MDR`
 - **Schemas:** `RAW`, `STAGED`, `ANALYTICAL`
 - **Credentials:** in `.env` — never commit this file
-- **Dashboard usage:** Snowflake is read-only for RAW + STAGED display.
+- **RAW tables** — three source-native tables, one per source system:
+  - `RAW.WINDCHILL_DOCUMENTS` (30 rows) — `wc_*` fields, ISO 8601 timestamps, A/B/C revisions
+  - `RAW.SHAREPOINT_DOCUMENTS` (20 rows) — `sp_*` fields, MM/DD/YYYY dates stored as VARCHAR
+  - `RAW.AVEVA_DOCUMENTS` (10 rows) — `aveva_*` fields, DD.MM.YYYY dates stored as VARCHAR, numeric revisions
+  - Date formats in RAW are deliberately preserved in source-native form — the STAGED layer normalises them
+- **Dashboard usage:** reads `STAGED.EVENTS` and `ANALYTICAL.MDR_REQUIREMENTS` live from Snowflake.
   ANALYTICAL edits write to the local CSV, not back to Snowflake.
 
 ---
