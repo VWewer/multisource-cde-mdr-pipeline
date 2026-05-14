@@ -46,7 +46,7 @@ aveva_source.csv      ──┘                              ► staged_cross_re
                                                                           load_to_snowflake.py
                                                                                        │
                                               ┌────────────────────────────────────────┤
-                                              │  Snowflake: WINDCHILL_MDR database     │
+                                              │  Snowflake: MULTISOURCE_CDE_MDR_PIPELINE database     │
                                               │  RAW.WINDCHILL_DOCUMENTS  (30 rows)    │
                                               │  RAW.SHAREPOINT_DOCUMENTS (20 rows)    │
                                               │  RAW.AVEVA_DOCUMENTS      (10 rows)    │
@@ -75,7 +75,7 @@ Three roles (no credentials required — demo-friendly): Read Only, Project Mana
 
 ## Snowflake integration
 
-- **Database:** `WINDCHILL_MDR`
+- **Database:** `MULTISOURCE_CDE_MDR_PIPELINE`
 - **Schemas:** `RAW`, `STAGED`, `ANALYTICAL`
 - **RAW tables** — source-native schemas, one per system:
   - `RAW.WINDCHILL_DOCUMENTS` — `wc_*` field names, ISO 8601 dates, A/B/C revisions

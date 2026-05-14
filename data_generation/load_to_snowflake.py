@@ -2,18 +2,20 @@
 load_to_snowflake.py
 multisource-cde-mdr-pipeline
 
-Creates (or replaces) five tables in Snowflake and loads CSV data into them:
+Creates (or replaces) seven tables in Snowflake and loads CSV data into them:
 
   RAW layer — source-native schemas, one table per source system:
     RAW.WINDCHILL_DOCUMENTS   (30 rows — Windchill field names, ISO dates, A/B/C revisions)
     RAW.SHAREPOINT_DOCUMENTS  (20 rows — SharePoint field names, MM/DD/YYYY dates, 1.0/2.0 versions)
     RAW.AVEVA_DOCUMENTS       (10 rows — Aveva field names, DD.MM.YYYY dates, numeric revisions)
 
-  STAGED layer — harmonised, one canonical event log:
+  STAGED layer — harmonised pipeline outputs:
     STAGED.EVENTS             (~510 rows — canonical ISO 19650 IDs, normalised schema)
+    STAGED.DQ_FLAGS           (~15 rows — data quality issues flagged at pipeline run time)
 
-  ANALYTICAL layer — MDR register built from STAGED:
+  ANALYTICAL layer — dashboard-facing tables:
     ANALYTICAL.MDR_REQUIREMENTS (60 rows — schedule, RAG status, delivery visibility)
+    ANALYTICAL.EDIT_LOG         (append-only audit trail of all user edits and DQ resolutions)
 
 The RAW tables deliberately preserve source-native field names and date formats.
 The STAGED layer is where all harmonisation happens — the schema difference is the demo point.
@@ -48,8 +50,11 @@ SP_CSV     = SCRIPT_DIR / "sharepoint_source.csv"
 AVEVA_CSV  = SCRIPT_DIR / "aveva_source.csv"
 
 # Pipeline output CSVs (STAGED and ANALYTICAL layers)
-STAGED_CSV = SCRIPT_DIR / "staged_events.csv"
-MDR_CSV    = SCRIPT_DIR / "mdr_requirements.csv"
+STAGED_CSV  = SCRIPT_DIR / "staged_events.csv"
+DQ_CSV      = SCRIPT_DIR / "staged_dq_flags.csv"
+MDR_CSV     = SCRIPT_DIR / "mdr_requirements.csv"
+# Edit log lives in dashboard/ — it is written by the dashboard at runtime, not by the pipeline
+EDITLOG_CSV = PROJECT_ROOT / "dashboard" / "edit_log.csv"
 
 # ── DDL — RAW layer: source-native tables ─────────────────────────────────────
 # These tables store data exactly as it came out of each source system.
@@ -169,6 +174,47 @@ CREATE OR REPLACE TABLE STAGED.EVENTS (
     entered_by               VARCHAR(200),
     comments                 TEXT,
     PRIMARY KEY (event_id)
+);
+"""
+
+# ── DDL — STAGED.DQ_FLAGS ────────────────────────────────────────────────────
+# Data quality issues flagged by the pipeline at staged layer run time.
+# resolved/resolved_by/resolved_at are populated by the Document Controller
+# via the dashboard remediation queue. This table shows stale state until
+# load_to_snowflake.py is rerun — that staleness is intentional in the demo.
+
+DDL_DQ = """
+CREATE OR REPLACE TABLE STAGED.DQ_FLAGS (
+    flag_id          VARCHAR(20)   NOT NULL,
+    mdr_id           VARCHAR(60),
+    source_system    VARCHAR(50),
+    source_native_id VARCHAR(100),
+    field_name       VARCHAR(100),
+    flag_type        VARCHAR(50),
+    flag_detail      TEXT,
+    original_value   VARCHAR(500),
+    suggested_value  VARCHAR(500),
+    resolved         BOOLEAN,
+    resolved_by      VARCHAR(200),
+    resolved_at      TIMESTAMP_TZ,
+    PRIMARY KEY (flag_id)
+);
+"""
+
+# ── DDL — ANALYTICAL.EDIT_LOG ─────────────────────────────────────────────────
+# Append-only audit trail written by the dashboard for every user action:
+# PM_UPDATE events (priority, critical path, percent complete, notes) and
+# DQ_REMEDIATION events (DC resolving a flagged field).
+# The 'field' column encodes event type, e.g. "dq_flag_resolved:DQF-0001".
+
+DDL_EDITLOG = """
+CREATE OR REPLACE TABLE ANALYTICAL.EDIT_LOG (
+    timestamp  TIMESTAMP_TZ,
+    username   VARCHAR(200),
+    mdr_id     VARCHAR(60),
+    field      VARCHAR(200),
+    old_value  TEXT,
+    new_value  TEXT
 );
 """
 
@@ -302,12 +348,14 @@ def load_csv(cursor, csv_path: Path, table: str,
 def main():
     """Connect to Snowflake, create the schema, and load all five tables."""
 
-    # Verify all CSVs exist before connecting
+    # Verify all required CSVs exist before connecting.
+    # edit_log.csv is optional — it may be empty if no user edits have been made yet.
     required = {
         "windchill_source.csv":  WC_CSV,
         "sharepoint_source.csv": SP_CSV,
         "aveva_source.csv":      AVEVA_CSV,
         "staged_events.csv":     STAGED_CSV,
+        "staged_dq_flags.csv":   DQ_CSV,
         "mdr_requirements.csv":  MDR_CSV,
     }
     missing = [name for name, path in required.items() if not path.exists()]
@@ -316,6 +364,8 @@ def main():
             print(f"[ERROR] Missing: {name}")
         print("  Run the generate_*.py scripts first.")
         return
+    if not EDITLOG_CSV.exists():
+        print("  WARN: dashboard/edit_log.csv not found — ANALYTICAL.EDIT_LOG will be empty")
 
     # Connect to Snowflake
     print("[SNOWFLAKE] Connecting...")
@@ -358,7 +408,9 @@ def main():
         ("RAW.SHAREPOINT_DOCUMENTS",     DDL_SP),
         ("RAW.AVEVA_DOCUMENTS",          DDL_AVEVA),
         ("STAGED.EVENTS",                DDL_STAGED),
+        ("STAGED.DQ_FLAGS",              DDL_DQ),
         ("ANALYTICAL.MDR_REQUIREMENTS",  DDL_MDR),
+        ("ANALYTICAL.EDIT_LOG",          DDL_EDITLOG),
     ]
     for name, ddl in table_ddls:
         cursor.execute(ddl)
@@ -390,7 +442,7 @@ def main():
         # aveva_issue_date and aveva_last_updated stored as VARCHAR — DD.MM.YYYY format preserved intentionally
     )
 
-    # Load STAGED layer (harmonised event log)
+    # Load STAGED layer (harmonised event log + DQ flags)
     print("\n[SNOWFLAKE] Loading STAGED layer...")
     load_csv(
         cursor, STAGED_CSV, "STAGED.EVENTS",
@@ -399,8 +451,15 @@ def main():
         ts_fields    = {"planned_timestamp", "actual_timestamp"},
         date_fields  = set(),
     )
+    load_csv(
+        cursor, DQ_CSV, "STAGED.DQ_FLAGS",
+        bool_fields  = {"resolved"},
+        int_fields   = set(),
+        ts_fields    = {"resolved_at"},
+        date_fields  = set(),
+    )
 
-    # Load ANALYTICAL layer (MDR register)
+    # Load ANALYTICAL layer (MDR register + audit trail)
     print("\n[SNOWFLAKE] Loading ANALYTICAL layer...")
     load_csv(
         cursor, MDR_CSV, "ANALYTICAL.MDR_REQUIREMENTS",
@@ -411,6 +470,17 @@ def main():
         date_fields  = {"planned_submission_date", "planned_approval_date",
                         "baseline_approval_date", "previous_approval_date"},
     )
+    # edit_log.csv may not exist yet if no user edits have been made
+    if EDITLOG_CSV.exists():
+        load_csv(
+            cursor, EDITLOG_CSV, "ANALYTICAL.EDIT_LOG",
+            bool_fields  = set(),
+            int_fields   = set(),
+            ts_fields    = {"timestamp"},
+            date_fields  = set(),
+        )
+    else:
+        print("  WARN: dashboard/edit_log.csv not found — ANALYTICAL.EDIT_LOG left empty")
 
     conn.commit()
     cursor.close()
@@ -418,8 +488,8 @@ def main():
     print("\n[SNOWFLAKE] Load complete.")
     print(f"  Database : {db}")
     print(f"  RAW      : WINDCHILL_DOCUMENTS, SHAREPOINT_DOCUMENTS, AVEVA_DOCUMENTS")
-    print(f"  STAGED   : EVENTS")
-    print(f"  ANALYTICAL: MDR_REQUIREMENTS")
+    print(f"  STAGED   : EVENTS, DQ_FLAGS")
+    print(f"  ANALYTICAL: MDR_REQUIREMENTS, EDIT_LOG")
 
 if __name__ == "__main__":
     main()

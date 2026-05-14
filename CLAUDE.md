@@ -459,7 +459,7 @@ Populated at pipeline run time. Read by Source System Health page. Resolved by D
 ---
 
 ## Snowflake
-- **Database:** `WINDCHILL_MDR`
+- **Database:** `MULTISOURCE_CDE_MDR_PIPELINE`
 - **Schemas:** `RAW`, `STAGED`, `ANALYTICAL`
 - **Credentials:** in `.env` — never commit this file
 - **RAW tables** — three source-native tables, one per source system:

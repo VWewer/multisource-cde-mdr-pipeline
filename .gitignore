@@ -219,3 +219,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Streamlit runtime output logs
+streamlit_out.txt
+streamlit_err.txt
+
+# Private folder — ISO standards, slide decks, scripts, audio/video editing files.
+# Anything dropped here is never committed regardless of file type.
+private/
+
+# Video / screen recordings — too large for git
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wmv
+*.webm
+
+# Audio files
+*.mp3
+*.wav
+*.aac
+*.m4a
