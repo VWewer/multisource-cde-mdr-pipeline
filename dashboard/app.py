@@ -3134,9 +3134,10 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
                             ):
                                 now_str = str(datetime.now(timezone.utc))
                                 mask = dq_raw["flag_id"] == flag_id
-                                dq_raw.loc[mask, "resolved"]    = True
-                                dq_raw.loc[mask, "resolved_by"] = current_user
-                                dq_raw.loc[mask, "resolved_at"] = now_str
+                                dq_raw.loc[mask, "resolved"]       = True
+                                dq_raw.loc[mask, "resolved_by"]    = current_user
+                                dq_raw.loc[mask, "resolved_at"]    = now_str
+                                dq_raw.loc[mask, "resolved_value"] = sugg
                                 # Write the canonical suggested value — not "confirmed" —
                                 # so the audit trail records the actual mapping applied.
                                 log_edit(
@@ -3171,9 +3172,10 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
                                 if resolution_val.strip():
                                     now_str = str(datetime.now(timezone.utc))
                                     mask = dq_raw["flag_id"] == flag_id
-                                    dq_raw.loc[mask, "resolved"]    = True
-                                    dq_raw.loc[mask, "resolved_by"] = current_user
-                                    dq_raw.loc[mask, "resolved_at"] = now_str
+                                    dq_raw.loc[mask, "resolved"]       = True
+                                    dq_raw.loc[mask, "resolved_by"]    = current_user
+                                    dq_raw.loc[mask, "resolved_at"]    = now_str
+                                    dq_raw.loc[mask, "resolved_value"] = resolution_val.strip()
                                     log_edit(
                                         current_user, mdr_id,
                                         f"dq_flag_resolved:{flag_id}",

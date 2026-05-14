@@ -267,12 +267,13 @@ use the staging keys.
 
 ### Pre-interview checklist (do this before any interview)
 
-1. **Sync Snowflake** — run the load script to push all five tables (safe to rerun, uses CREATE OR REPLACE):
+1. **Sync Snowflake** — run the load script to push all seven tables (safe to rerun, uses CREATE OR REPLACE):
    ```powershell
    cd data_generation
    python load_to_snowflake.py
    ```
-   Expected output: 30 + 20 + 10 rows into RAW, 510 into STAGED, 60 into ANALYTICAL.
+   Expected output: 30 + 20 + 10 rows into RAW, 510 + 61 rows into STAGED, 60 rows into ANALYTICAL.
+   WARN on EDIT_LOG is normal if no user edits have been made yet.
 
 2. **Dress rehearsal** — run through the demo path end to end, in order:
    - Overview → explain the business problem (RAG tiles, Critical Path panel)
@@ -296,13 +297,18 @@ that is sufficient to demonstrate Snowflake integration. In conversation:
 
 ### Architecture note — DQ_REMEDIATION audit trail
 
-When a DC marks a flag resolved, the event is written to `dashboard/edit_log.csv`
-(the dashboard audit trail), NOT to `staged_events.csv`. The staged_events.csv is the
-pipeline's document lifecycle event log (status transitions generated at pipeline run time)
-and must not be mixed with dashboard user actions. The log_edit() function handles
-both PM_UPDATE and DQ_REMEDIATION records — distinguished by the `field` column value
-(e.g. `dq_flag_resolved:DQF-0001`). The Resolution Audit Trail tab in Source System Health
-reads edit_log.csv and surfaces these events in the UI.
+When a DC marks a flag resolved, two things are written:
+1. `dashboard/edit_log.csv` — the `log_edit()` function appends a DQ_REMEDIATION event
+   (`field` = `dq_flag_resolved:DQF-0001`, `new_value` = the corrected value entered by DC).
+2. `data_generation/staged_dq_flags.csv` — `resolved=True`, `resolved_by`, `resolved_at`,
+   and `resolved_value` (the corrected value) are written directly to the flag record.
+
+The `resolved_value` column is the key field for the Snowflake demo: it lets you query
+`STAGED.DQ_FLAGS` directly and show the before/after without a JOIN.
+
+`staged_events.csv` is the pipeline's document lifecycle event log and must not be mixed
+with dashboard user actions. The Resolution Audit Trail tab in Source System Health reads
+`edit_log.csv` and surfaces DQ_REMEDIATION events in the UI.
 
 ## Important fields in v2
 
@@ -467,8 +473,27 @@ Populated at pipeline run time. Read by Source System Health page. Resolved by D
   - `RAW.SHAREPOINT_DOCUMENTS` (20 rows) — `sp_*` fields, MM/DD/YYYY dates stored as VARCHAR
   - `RAW.AVEVA_DOCUMENTS` (10 rows) — `aveva_*` fields, DD.MM.YYYY dates stored as VARCHAR, numeric revisions
   - Date formats in RAW are deliberately preserved in source-native form — the STAGED layer normalises them
+- **STAGED.DQ_FLAGS** (~61 rows) — DQ issues flagged at pipeline run time. Key columns:
+  - `resolved` BOOLEAN — False until DC resolves via dashboard
+  - `resolved_value` VARCHAR — the corrected value entered by the DC; populated on resolution
+  - `resolved_by`, `resolved_at` — who resolved it and when
+- **ANALYTICAL.EDIT_LOG** — append-only audit trail; every PM_UPDATE and DQ_REMEDIATION event
 - **Dashboard usage:** reads `STAGED.EVENTS` and `ANALYTICAL.MDR_REQUIREMENTS` live from Snowflake.
   ANALYTICAL edits write to the local CSV, not back to Snowflake.
+
+### Demo Snowflake query — DQ flag resolution workflow
+
+Run this before resolving a flag (shows unresolved, no value):
+```sql
+SELECT flag_id, mdr_id, field_name, resolved, resolved_value
+FROM STAGED.DQ_FLAGS
+WHERE flag_id = 'DQF-0001';
+```
+
+Resolve the flag in the dashboard (Document Controller role → Source System Health),
+then run `python load_to_snowflake.py`, then rerun the query. Result:
+- `RESOLVED = TRUE`
+- `RESOLVED_VALUE = <the author name the DC entered>`
 
 ---
 

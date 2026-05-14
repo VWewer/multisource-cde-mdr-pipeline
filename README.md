@@ -45,14 +45,16 @@ aveva_source.csv      ──┘                              ► staged_cross_re
                                                                                        │
                                                                           load_to_snowflake.py
                                                                                        │
-                                              ┌────────────────────────────────────────┤
-                                              │  Snowflake: MULTISOURCE_CDE_MDR_PIPELINE database     │
-                                              │  RAW.WINDCHILL_DOCUMENTS  (30 rows)    │
-                                              │  RAW.SHAREPOINT_DOCUMENTS (20 rows)    │
-                                              │  RAW.AVEVA_DOCUMENTS      (10 rows)    │
-                                              │  STAGED.EVENTS            (~510 rows)  │
-                                              │  ANALYTICAL.MDR_REQUIREMENTS (60 rows) │
-                                              └────────────────────────────────────────┘
+                                              ┌─────────────────────────────────────────────┐
+                                              │  Snowflake: MULTISOURCE_CDE_MDR_PIPELINE    │
+                                              │  RAW.WINDCHILL_DOCUMENTS    (30 rows)        │
+                                              │  RAW.SHAREPOINT_DOCUMENTS   (20 rows)        │
+                                              │  RAW.AVEVA_DOCUMENTS        (10 rows)        │
+                                              │  STAGED.EVENTS              (~510 rows)      │
+                                              │  STAGED.DQ_FLAGS            (~61 rows)       │
+                                              │  ANALYTICAL.MDR_REQUIREMENTS (60 rows)       │
+                                              │  ANALYTICAL.EDIT_LOG        (audit trail)    │
+                                              └─────────────────────────────────────────────┘
 ```
 
 The RAW layer holds each source system's data in its native schema — field names, date formats, and revision schemes are preserved exactly as they arrived. The STAGED layer harmonises all three into a single canonical schema. The Streamlit dashboard reads from STAGED and ANALYTICAL. All user edits (PM updates, DQ remediations) are written locally as append-only event records — full audit trail always recoverable.
@@ -82,7 +84,9 @@ Three roles (no credentials required — demo-friendly): Read Only, Project Mana
   - `RAW.SHAREPOINT_DOCUMENTS` — `sp_*` field names, MM/DD/YYYY dates, 1.0/2.0 versions
   - `RAW.AVEVA_DOCUMENTS` — `aveva_*` field names, DD.MM.YYYY dates, numeric revisions
 - **STAGED.EVENTS** — harmonised event log (~510 rows, canonical ISO 19650 IDs)
+- **STAGED.DQ_FLAGS** — data quality issues flagged at pipeline run time (~61 rows); `resolved_value` column populated by Document Controller via dashboard
 - **ANALYTICAL.MDR_REQUIREMENTS** — MDR register read by the dashboard (60 rows)
+- **ANALYTICAL.EDIT_LOG** — append-only audit trail of all user actions (PM updates + DC remediations)
 - Credentials are stored in `.env` (see `.env.example`) — never committed
 
 ---

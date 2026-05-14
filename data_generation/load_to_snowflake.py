@@ -197,6 +197,7 @@ CREATE OR REPLACE TABLE STAGED.DQ_FLAGS (
     resolved         BOOLEAN,
     resolved_by      VARCHAR(200),
     resolved_at      TIMESTAMP_TZ,
+    resolved_value   VARCHAR(500),
     PRIMARY KEY (flag_id)
 );
 """

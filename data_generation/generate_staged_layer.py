@@ -466,6 +466,7 @@ def make_dq_flag(
         "resolved":         False,
         "resolved_by":      "",
         "resolved_at":      "",
+        "resolved_value":   "",  # populated by DC via dashboard; queryable in Snowflake after push
     }
 
 
@@ -1407,7 +1408,7 @@ DQ_FIELDNAMES = [
     "flag_id", "mdr_id", "source_system", "source_native_id",
     "field_name", "flag_type", "flag_detail",
     "original_value", "suggested_value",
-    "resolved", "resolved_by", "resolved_at",
+    "resolved", "resolved_by", "resolved_at", "resolved_value",
 ]
 
 
