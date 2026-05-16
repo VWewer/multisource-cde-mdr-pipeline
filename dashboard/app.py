@@ -2933,7 +2933,7 @@ def page_source_health(df: pd.DataFrame, current_user: str, active_role: str):
     # resolved_by / resolved_at / resolved_note are all-null until a DC resolves a flag.
     # pandas reads all-null columns as float64; casting to object lets us assign
     # string values later without a TypeError.
-    for _col in ("resolved_by", "resolved_at", "resolved_note"):
+    for _col in ("resolved_by", "resolved_at", "resolved_note", "resolved_value"):
         if _col in dq_raw.columns:
             dq_raw[_col] = dq_raw[_col].astype(object)
 
